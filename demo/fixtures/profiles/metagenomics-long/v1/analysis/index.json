@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "job_id": "demo-fixture",
+  "sample": "DEMO_COMMUNITY_LONG",
+  "analysis_type": "metagenomics",
+  "mode": "long",
+  "generated_at": "2026-08-18T00:00:00Z",
+  "sections": [{"id": "meta_checkm2_quality", "title": "MAG completeness and contamination", "type": "plotly", "path": "analysis_plots/overview.json", "source": "demo", "order": 100, "renderer": "checkm2_quality"}],
+  "generator_runs": []
+}

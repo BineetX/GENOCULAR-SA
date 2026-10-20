@@ -1,0 +1,1594 @@
+import copy
+import csv
+import gzip
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import yaml
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+
+# =============================================================================
+# EMBEDDED STANDALONE CONFIGURATION
+# =============================================================================
+# Local environment variables and server paths override these values dynamically.
+EMBEDDED_CONFIG_YAML = r"""
+sample: marine_station_alpha
+environment: ocean
+input:
+  r1: /home/rashmi/Marine/Data/metagenome_test/data/raw/SRR5720233_1.fastq
+  r2: /home/rashmi/Marine/Data/metagenome_test/data/raw/SRR5720233_2.fastq
+results_root: results
+threads: 64
+memory_mb: 64000
+runtime_min: 720
+host_removal:
+  enabled: false
+  database: null
+  bowtie2_options: null
+fastp:
+  qualified_quality_phred: 15
+  cut_mean_quality: 20
+  cut_window_size: 4
+  minimum_length: 50
+  unqualified_percent_limit: 40
+  n_base_limit: 5
+  poly_g_mode: auto
+filtering:
+  master_retain_floor: 500
+megahit:
+  preset: default
+  memory_fraction: 0.8
+metaquast_references: []
+kraken2:
+  enabled: true
+  confidence: 0.0
+  minimum_hit_groups: 2
+  memory_mapping: false
+bracken:
+  read_length: 150
+  level: S
+  threshold: 10
+viral:
+  enabled: true
+  virsorter2_min_length: 1500
+  virsorter2_min_score: 0.5
+binning_thresholds:
+  metabat_min_contig: 2000
+  metabat_min_cv: 1.0
+  metabat_min_cv_sum: 1.0
+  metabat_seed: 42
+  maxbin_min_contig: 2000
+  semibin_min_contig: 2000
+  dastool_score_default: 0.5
+semibin:
+  use_pretrained_model: true
+  environment: ocean
+quality_thresholds:
+  high_completeness: 90.0
+  high_contamination: 5.0
+  medium_completeness: 50.0
+  medium_contamination: 10.0
+  minimum_trna_isotypes: 18
+  require_gunc_pass_for_production: true
+checkm2:
+  low_memory: true
+gunc:
+  sensitive: false
+  minimum_mapped_genes: 11
+drep_options:
+  primary_ani: 0.9
+  secondary_ani: 0.95
+  minimum_aligned_fraction: 0.3
+  secondary_algorithm: fastANI
+prodigal:
+  mode: auto
+coverm_options:
+  min_covered_fraction: 0.3
+  min_read_percent_identity: 95.0
+  min_read_aligned_percent: 75.0
+  mapper: minimap2-sr
+metaphlan_index: mpa_vJan25_CHOCOPhlAnSGB_202503
+mag_threads: 4
+annotation_modules:
+  prokka: true
+  cctyper: true
+  dbcan: true
+  dram: true
+  abricate: true
+  hadeg: true
+reporting:
+  multiqc: true
+abricate_dbs:
+- ncbi
+- card
+- resfinder
+- vfdb
+prokka:
+  kingdom: auto
+  fallback_kingdom: Bacteria
+  metagenome: true
+dbcan:
+  input_type: prok
+"""
+
+DEFAULT_CONFIG = yaml.safe_load(EMBEDDED_CONFIG_YAML) or {}
+
+def apply_missing_defaults(target, defaults):
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = copy.deepcopy(value)
+        elif isinstance(target[key], dict) and isinstance(value, dict):
+            apply_missing_defaults(target[key], value)
+
+apply_missing_defaults(config, DEFAULT_CONFIG)
+
+def as_bool(value):
+    if isinstance(value, bool): return value
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {"true", "yes", "1", "on"}: return True
+        if value in {"false", "no", "0", "off", ""}: return False
+    return bool(value)
+
+def clean_mag_id(value):
+    value = os.path.basename(str(value).strip())
+    for suffix in (".fasta.gz", ".fna.gz", ".fa.gz", ".fasta", ".fna", ".fa"):
+        if value.endswith(suffix): return value[:-len(suffix)]
+    return value
+
+def parse_float(value):
+    try:
+        if value is None or str(value).strip().lower() in {"", "na", "nan", "none"}: return None
+        return float(value)
+    except (TypeError, ValueError): return None
+
+def parse_bool(value):
+    if isinstance(value, bool): return value
+    if value is None: return None
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "pass", "passed"}: return True
+    if value in {"false", "0", "no", "fail", "failed"}: return False
+    return None
+
+def gzip_has_data(path):
+    try:
+        with gzip.open(path, "rb") as handle: return bool(handle.read(1))
+    except OSError: return False
+
+def fasta_records(path):
+    name = None
+    sequence = []
+    with open(path, "rt") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line: continue
+            if line.startswith(">"):
+                if name is not None: yield name, "".join(sequence)
+                name = line[1:].split()[0]
+                sequence = []
+            else: sequence.append(line)
+        if name is not None: yield name, "".join(sequence)
+
+def fasta_metrics(path):
+    lengths, gc, total = [], 0, 0
+    for _, sequence in fasta_records(path):
+        length = len(sequence)
+        lengths.append(length)
+        total += length
+        gc += sequence.upper().count("G") + sequence.upper().count("C")
+    lengths.sort(reverse=True)
+    threshold = total / 2.0
+    cumulative, n50 = 0, 0
+    for length in lengths:
+        cumulative += length
+        if cumulative >= threshold:
+            n50 = length
+            break
+    return {
+        "contig_count": len(lengths), "total_length": total, "n50": n50,
+        "gc_percent": round((100.0 * gc / total), 6) if total else 0.0,
+    }
+
+def write_contig2bin(bin_dir, output_tsv):
+    rows = []
+    for fasta in sorted(Path(bin_dir).glob("*.fa")):
+        bin_id = fasta.stem
+        for contig, _ in fasta_records(fasta): rows.append((contig, bin_id))
+    Path(output_tsv).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_tsv, "w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerows(rows)
+
+def normalize_bins(source_paths, destination):
+    destination = Path(destination)
+    shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for source in sorted({Path(path) for path in source_paths if Path(path).is_file()}):
+        if source.stat().st_size == 0: continue
+        target = destination / f"{clean_mag_id(source.name)}.fa"
+        shutil.copyfile(source, target)
+        copied += 1
+    return copied
+
+def first_existing(paths):
+    for path in paths:
+        if os.path.isfile(path): return path
+    raise FileNotFoundError("None of the expected files exists: " + ", ".join(map(str, paths)))
+
+def run_command(command, log_path, cwd=None, append=False, env=None):
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    mode = "ab" if append else "wb"
+    run_env = env if env is not None else os.environ.copy()
+    if isinstance(command, list) and len(command) > 0:
+        binary_path = Path(command[0])
+        if binary_path.is_absolute():
+            run_env["PATH"] = str(binary_path.parent) + os.pathsep + run_env.get("PATH", "")
+    elif isinstance(command, str):
+        try:
+            tokens = shlex.split(command)
+            if tokens:
+                binary_path = Path(tokens[0])
+                if binary_path.is_absolute():
+                    run_env["PATH"] = str(binary_path.parent) + os.pathsep + run_env.get("PATH", "")
+        except Exception:
+            pass
+    with open(log_path, mode) as log_handle:
+        subprocess.run(command, cwd=cwd, stdout=log_handle, stderr=subprocess.STDOUT, env=run_env, check=True)
+
+def fastqc_stem(path):
+    name = Path(path).name
+    for suffix in (".gz", ".bz2", ".fastq", ".fq"):
+        if name.endswith(suffix): name = name[:-len(suffix)]
+    return name
+
+def run_fastqc(inputs, outputs, log_path, threads):
+    output_parent = Path(outputs[0]).parent
+    output_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="fastqc_", dir=str(output_parent)) as tmpdir:
+        run_command([FASTQC, "--threads", str(threads), "--outdir", tmpdir, *map(str, inputs)], log_path)
+        generated = []
+        for input_path in inputs:
+            stem = fastqc_stem(input_path)
+            generated.extend([
+                os.path.join(tmpdir, f"{stem}_fastqc.html"),
+                os.path.join(tmpdir, f"{stem}_fastqc.zip"),
+            ])
+        for source, target in zip(generated, outputs):
+            if not os.path.isfile(source): raise FileNotFoundError(source)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(source, target)
+
+def prefix_fasta(input_path, output_path, prefix):
+    with open(output_path, "w") as output_handle:
+        for name, sequence in fasta_records(input_path):
+            output_handle.write(f">{prefix}|{name}\n")
+            for start in range(0, len(sequence), 80):
+                output_handle.write(sequence[start:start + 80] + "\n")
+
+# =============================================================================
+# ENVIRONMENT & PATH RESOLUTION
+# =============================================================================
+
+def _find_env(env_var, env_names, probe):
+    candidates = [os.environ.get(env_var, "")]
+    expanded_names = []
+    for name in env_names:
+        expanded_names.extend([name, f"{name}_env", f"{name}2_env"])
+    conda_envs_dir = os.path.join(os.path.expanduser("~"), ".conda", "envs")
+    candidates.extend(os.path.join(conda_envs_dir, name) for name in expanded_names)
+    candidates.extend(f"/opt/conda/envs/{name}" for name in expanded_names)
+    shared = Path(os.environ.get(
+        "SHARED_CONDA_PREFIX",
+        "/data/genoverse/smk_envs_profiles/metagenomics/short/tool_envs",
+    ))
+    candidates.extend(str(shared / name) for name in env_names)
+    if shared.exists():
+        candidates.extend(str(path) for path in sorted(shared.iterdir()) if path.is_dir())
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "bin" / probe).exists():
+            return Path(candidate)
+    return None
+
+def _tool(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin" / binary) if env_dir else binary
+
+def _binpath(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin") if env_dir else ""
+
+
+SAMPLE = os.environ.get("SAMPLE", str(config.get("sample", "marine_station_alpha")))
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", SAMPLE):
+    raise ValueError("sample must contain only letters, numbers, '.', '_', and '-'")
+
+THREADS = int(os.environ.get("THREADS", config.get("threads", 64)))
+MEMORY_MB = int(config.get("memory_mb", 64000))
+RUNTIME_MIN = int(config.get("runtime_min", 720))
+ENVIRONMENT = str(config.get("environment", "global")).strip().lower().replace("waste_water", "wastewater")
+
+INPUT_CONFIG = config.get("input", {})
+RAW_R1 = os.environ.get("RAW_R1", str(INPUT_CONFIG.get("r1", f"data/raw/{SAMPLE}_R1.fastq.gz")))
+RAW_R2 = os.environ.get("RAW_R2", str(INPUT_CONFIG.get("r2", f"data/raw/{SAMPLE}_R2.fastq.gz")))
+
+# Safe root resolution to prevent redundant './'
+_base = config.get("BASE", os.environ.get("BASE_PATH", ""))
+_root = config.get('results_root', 'results')
+OUTPUT_ROOT = f"{_base}/{_root}" if _base and _base != "." else _root
+OUTPUT_ROOT = OUTPUT_ROOT.replace("//", "/")
+if OUTPUT_ROOT.startswith("./"):
+    OUTPUT_ROOT = OUTPUT_ROOT[2:]
+
+RAW_QC_DIR = f"{OUTPUT_ROOT}/01_qc/raw_fastqc"
+FASTP_DIR = f"{OUTPUT_ROOT}/02_clean_reads/fastp"
+HOST_DIR = f"{OUTPUT_ROOT}/02_clean_reads/host_removed"
+CLEAN_QC_DIR = f"{OUTPUT_ROOT}/02_clean_reads/clean_fastqc"
+NONPAREIL_DIR = f"{OUTPUT_ROOT}/02_clean_reads/nonpareil"
+PROFILE_DIR = f"{OUTPUT_ROOT}/03_profiles"
+METAPHLAN_DIR = f"{PROFILE_DIR}/metaphlan"
+KRAKEN_DIR = f"{PROFILE_DIR}/kraken_bracken"
+ASSEMBLY_DIR = f"{OUTPUT_ROOT}/04_assembly"
+ASSEMBLY_QC_DIR = f"{OUTPUT_ROOT}/04_assembly_qc"
+VIRAL_DIR = f"{OUTPUT_ROOT}/05_viral"
+MAP_DIR = f"{OUTPUT_ROOT}/06_mapping"
+BIN_DIR = f"{OUTPUT_ROOT}/07_binning"
+MAG_QC_DIR = f"{OUTPUT_ROOT}/08_mag_qc"
+FILTERED_DIR = f"{OUTPUT_ROOT}/09_filtered_catalog"
+DREP_DIR = f"{OUTPUT_ROOT}/10_dereplication"
+GTDB_DIR = f"{OUTPUT_ROOT}/11_taxonomy"
+ANNOTATION_DIR = f"{OUTPUT_ROOT}/12_annotation"
+COVERM_DIR = f"{OUTPUT_ROOT}/13_abundance"
+MULTIQC_DIR = f"{OUTPUT_ROOT}/15_report/multiqc"
+LOG_DIR = f"{OUTPUT_ROOT}/logs"
+
+# Tools
+FASTQC        = _tool("GENOVERSE_ENV_FASTQC", ["fastqc"], "fastqc")
+FASTP         = _tool("GENOVERSE_ENV_MARINE", ["marine"], "fastp")
+PIGZ          = _tool("GENOVERSE_ENV_MARINE", ["marine"], "pigz")
+KNEADDATA     = _tool("GENOVERSE_ENV_KNEADDATA", ["kneaddata_env", "kneaddata"], "kneaddata")
+METAPHLAN     = _tool("GENOVERSE_ENV_METAPHLAN", ["metaphlan_env", "metaphlan"], "metaphlan")
+BOWTIE2_META  = _tool("GENOVERSE_ENV_METAPHLAN", ["metaphlan_env", "metaphlan"], "bowtie2")
+KRAKEN2       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2"], "kraken2")
+BRACKEN       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2"], "bracken")
+NONPAREIL     = _tool("GENOVERSE_ENV_NONPAREIL", ["nonpareil"], "nonpareil")
+MEGAHIT       = _tool("GENOVERSE_ENV_MEGAHIT", ["megahit_env", "megahit"], "megahit")
+BOWTIE2       = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2")
+BOWTIE2_BUILD = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2-build")
+SAMTOOLS      = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "samtools")
+METABAT2      = _tool("GENOVERSE_ENV_BINNING", ["binning"], "metabat2")
+SEMIBIN2      = _tool("GENOVERSE_ENV_BINNING", ["binning"], "SemiBin2")
+MAXBIN2       = _tool("GENOVERSE_ENV_BINNING", ["binning"], "run_MaxBin.pl")
+DASTOOL       = _tool("GENOVERSE_ENV_BINNING", ["binning"], "DAS_Tool")
+JGI_DEPTH     = _tool("GENOVERSE_ENV_BINNING", ["binning"], "jgi_summarize_bam_contig_depths")
+CHECKM2       = _tool("GENOVERSE_ENV_CHECKM2", ["checkm2_env", "checkm2"], "checkm2")
+GUNC          = _tool("GENOVERSE_ENV_GUNC", ["gunc_env", "gunc"], "gunc")
+GTDBTK        = _tool("GENOVERSE_ENV_GTDBTK", ["gtdbk_env", "gtdbtk"], "gtdbtk")
+DREP          = _tool("GENOVERSE_ENV_DREP", ["drep_env", "drep"], "dRep")
+BARRNAP       = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "barrnap")
+TRNASCAN      = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "tRNAscan-SE")
+PROKKA        = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "prokka")
+CCTYPER_BIN   = _tool("GENOVERSE_ENV_CCTYPER", ["cctyper"], "cctyper")
+DBCAN_BIN     = _tool("GENOVERSE_ENV_DBCAN", ["dbcan"], "run_dbcan")
+DRAM_BIN      = _tool("GENOVERSE_ENV_DRAM", ["dram"], "DRAM.py")
+ABRICATE      = _tool("GENOVERSE_ENV_ABRICATE", ["abricate-env", "abricate"], "abricate")
+PRODIGAL      = _tool("GENOVERSE_ENV_MARINE", ["marine"], "prodigal")
+GENOMAD       = _tool("GENOVERSE_ENV_GENOMAD", ["genomad"], "genomad")
+VIRSORTER2    = _tool("GENOVERSE_ENV_VIRSORTER", ["virsorter"], "virsorter")
+COVERM        = _tool("GENOVERSE_ENV_COVERM", ["coverm-env", "coverm"], "coverm")
+MULTIQC       = _tool("GENOVERSE_ENV_MULTIQC", ["multiqc_env", "multiqc"], "multiqc")
+QUAST         = _tool("GENOVERSE_ENV_QUAST", ["quast"], "metaquast.py")
+PROTEINORTHO  = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "proteinortho")
+HADEG_BLAST_BINPATH = _binpath("GENOVERSE_ENV_HADEG_BLAST", ["hadeg", "prokka", "binning", "marine"], "blastp")
+
+# Tool Env paths for $PATH modifications
+KNEADDATA_ENV = str(Path(KNEADDATA).parent)
+METAPHLAN_ENV = str(Path(METAPHLAN).parent)
+BINNING_ENV   = str(Path(METABAT2).parent)
+MAPPING_ENV   = str(Path(BOWTIE2).parent)
+PROKKA_ENV    = str(Path(PROKKA).parent)
+GTDBTK_ENV    = str(Path(GTDBTK).parent)
+DREP_ENV      = str(Path(DREP).parent)
+COVERM_ENV    = str(Path(COVERM).parent)
+CCTYPER_ENV   = str(Path(CCTYPER_BIN).parent)
+DBCAN_ENV     = str(Path(DBCAN_BIN).parent)
+ABRICATE_ENV  = str(Path(ABRICATE).parent)
+BARRNAP_ENV   = str(Path(BARRNAP).parent)
+CHECKM2_ENV   = str(Path(CHECKM2).parent)
+QUAST_ENV     = str(Path(QUAST).parent)
+DRAM_ENV      = str(Path(DRAM_BIN).parent)
+
+# Databases
+METAPHLAN_DB    = os.environ.get("METAPHLAN_DB", "")
+METAPHLAN_INDEX = str(config.get("metaphlan_index", "mpa_vJan25_CHOCOPhlAnSGB_202503"))
+KRAKEN2_DB      = os.environ.get("KRAKEN2_DB", "")
+GENOMAD_DB      = os.environ.get("GENOMAD_DB", "")
+VIRSORTER2_DB   = os.environ.get("VIRSORTER2_DB", "")
+CHECKM2_DB      = os.environ.get("CHECKM2_DB", "")
+GUNC_DB         = os.environ.get("GUNC_DB", "")
+GTDBTK_DATA_PATH= os.environ.get("GTDBTK_DATA_PATH", "")
+HADEG_DB        = os.environ.get("HADEG_DB", "")
+CCTYPER_DB      = os.environ.get("CCTYPER_DB", "")
+DBCAN_DB        = os.environ.get("DBCAN_DB_DIR", "")
+
+# Custom annotation directory setup block
+PROKKA_DIR = f"{ANNOTATION_DIR}/prokka"
+CCTYPER_DIR = f"{ANNOTATION_DIR}/cctyper"
+DBCAN_DIR = f"{ANNOTATION_DIR}/dbcan"
+DRAM_DIR = f"{ANNOTATION_DIR}/dram"
+ABRICATE_DIR = f"{ANNOTATION_DIR}/abricate"
+HADEG_OUTDIR = f"{ANNOTATION_DIR}/hadeg"
+
+# Annotation-specific configuration
+MAG_THREADS = int(config.get("mag_threads", 4))
+ABRICATE_DBS = [str(db) for db in config.get("abricate_dbs", ["ncbi", "card", "resfinder", "vfdb"])]
+
+ANNOTATION_MODULES = config.get("annotation_modules", {})
+RUN_PROKKA = as_bool(ANNOTATION_MODULES.get("prokka", True))
+RUN_CCTYPER = as_bool(ANNOTATION_MODULES.get("cctyper", False))
+RUN_DBCAN = as_bool(ANNOTATION_MODULES.get("dbcan", False))
+RUN_DRAM = as_bool(ANNOTATION_MODULES.get("dram", False))
+RUN_ABRICATE = as_bool(ANNOTATION_MODULES.get("abricate", True))
+RUN_HADEG = as_bool(ANNOTATION_MODULES.get("hadeg", False))
+RUN_KRAKEN = as_bool(config.get("kraken2", {}).get("enabled", True))
+RUN_VIRSORTER2 = as_bool(config.get("viral", {}).get("enabled", True))
+RUN_MULTIQC = as_bool(config.get("reporting", {}).get("multiqc", True))
+
+PROKKA_CONFIG = config.get("prokka", {})
+PROKKA_KINGDOM = str(PROKKA_CONFIG.get("kingdom", "auto")).strip().lower()
+PROKKA_FALLBACK_KINGDOM = str(PROKKA_CONFIG.get("fallback_kingdom", "Bacteria")).strip().capitalize()
+PROKKA_METAGENOME = as_bool(PROKKA_CONFIG.get("metagenome", True))
+
+DBCAN_CONFIG = config.get("dbcan", {})
+DBCAN_INPUT_TYPE = str(DBCAN_CONFIG.get("input_type", "prok")).strip().lower()
+
+HOST_CONFIG = config.get("host_removal", {})
+HOST_ENABLED = as_bool(HOST_CONFIG.get("enabled", config.get("run_host_removal", False)))
+HOST_DB = HOST_CONFIG.get("database", os.environ.get("KNEADDATA_DB"))
+HOST_BOWTIE2_OPTIONS = HOST_CONFIG.get("bowtie2_options")
+
+FASTP_CONFIG = config.get("fastp", {})
+FASTP_QUALIFIED_Q = int(FASTP_CONFIG.get("qualified_quality_phred", 15))
+FASTP_CUT_MEAN_Q = int(FASTP_CONFIG.get("cut_mean_quality", 20))
+FASTP_CUT_WINDOW = int(FASTP_CONFIG.get("cut_window_size", 4))
+FASTP_MIN_LENGTH = int(FASTP_CONFIG.get("minimum_length", 50))
+FASTP_MAX_UNQUALIFIED = int(FASTP_CONFIG.get("unqualified_percent_limit", 40))
+FASTP_N_BASE_LIMIT = int(FASTP_CONFIG.get("n_base_limit", 5))
+FASTP_POLY_G_MODE = str(FASTP_CONFIG.get("poly_g_mode", "auto")).lower()
+if FASTP_POLY_G_MODE == "auto":
+    FASTP_POLY_G_FLAGS = []
+elif FASTP_POLY_G_MODE == "on":
+    FASTP_POLY_G_FLAGS = ["--trim_poly_g", "--poly_g_min_len", "10"]
+elif FASTP_POLY_G_MODE == "off":
+    FASTP_POLY_G_FLAGS = ["--disable_trim_poly_g"]
+
+FILTER_CONFIG = config.get("filtering", {})
+ASSEMBLY_MIN_CONTIG = int(FILTER_CONFIG.get("master_retain_floor", 500))
+MEGAHIT_CONFIG = config.get("megahit", {})
+MEGAHIT_PRESET = str(MEGAHIT_CONFIG.get("preset", "default"))
+MEGAHIT_MEMORY = float(MEGAHIT_CONFIG.get("memory_fraction", 0.8))
+
+BINNING = config.get("binning_thresholds", {})
+METABAT_MIN_CONTIG = int(BINNING.get("metabat_min_contig", 1500))
+METABAT_MIN_CV = float(BINNING.get("metabat_min_cv", 1.0))
+METABAT_MIN_CV_SUM = float(BINNING.get("metabat_min_cv_sum", 1.0))
+METABAT_SEED = int(BINNING.get("metabat_seed", 42))
+MAXBIN_MIN_CONTIG = int(BINNING.get("maxbin_min_contig", 1500))
+SEMIBIN_MIN_CONTIG = int(BINNING.get("semibin_min_contig", 1500))
+DASTOOL_SCORE = float(BINNING.get("dastool_score_default", 0.5))
+
+SEMIBIN_CONFIG = config.get("semibin", {})
+SEMIBIN_USE_PRETRAINED = as_bool(SEMIBIN_CONFIG.get("use_pretrained_model", True))
+SEMIBIN_ENVIRONMENT = str(SEMIBIN_CONFIG.get("environment", ENVIRONMENT)).lower().replace("waste_water", "wastewater")
+
+KRAKEN_CONFIG = config.get("kraken2", {})
+KRAKEN_CONFIDENCE = float(KRAKEN_CONFIG.get("confidence", 0.0))
+KRAKEN_MIN_HIT_GROUPS = int(KRAKEN_CONFIG.get("minimum_hit_groups", 2))
+KRAKEN_MEMORY_MAPPING = as_bool(KRAKEN_CONFIG.get("memory_mapping", False))
+BRACKEN_CONFIG = config.get("bracken", {})
+BRACKEN_READ_LENGTH = int(BRACKEN_CONFIG.get("read_length", 150))
+BRACKEN_LEVEL = str(BRACKEN_CONFIG.get("level", "S"))
+BRACKEN_THRESHOLD = int(BRACKEN_CONFIG.get("threshold", 10))
+BRACKEN_DISTRIBUTION = f"{KRAKEN2_DB}/database{BRACKEN_READ_LENGTH}mers.kmer_distrib"
+
+VIRAL_CONFIG = config.get("viral", {})
+VIRSORTER_MIN_LENGTH = int(VIRAL_CONFIG.get("virsorter2_min_length", 1500))
+VIRSORTER_MIN_SCORE = float(VIRAL_CONFIG.get("virsorter2_min_score", 0.5))
+
+QUALITY = config.get("quality_thresholds", {})
+HIGH_COMPLETENESS = float(QUALITY.get("high_completeness", 90.0))
+HIGH_CONTAMINATION = float(QUALITY.get("high_contamination", 5.0))
+MEDIUM_COMPLETENESS = float(QUALITY.get("medium_completeness", 50.0))
+MEDIUM_CONTAMINATION = float(QUALITY.get("medium_contamination", 10.0))
+MIN_TRNA_ISOTYPES = int(QUALITY.get("minimum_trna_isotypes", 18))
+REQUIRE_GUNC_PASS = as_bool(QUALITY.get("require_gunc_pass_for_production", True))
+
+CHECKM2_CONFIG = config.get("checkm2", {})
+CHECKM2_LOWMEM = as_bool(CHECKM2_CONFIG.get("low_memory", True))
+GUNC_CONFIG = config.get("gunc", {})
+GUNC_SENSITIVE = as_bool(GUNC_CONFIG.get("sensitive", False))
+GUNC_MIN_MAPPED_GENES = int(GUNC_CONFIG.get("minimum_mapped_genes", 11))
+
+DREP_CONFIG = config.get("drep_options", {})
+DREP_PRIMARY_ANI = float(DREP_CONFIG.get("primary_ani", 0.90))
+DREP_SECONDARY_ANI = float(DREP_CONFIG.get("secondary_ani", 0.95))
+DREP_ALIGNED_FRACTION = float(DREP_CONFIG.get("minimum_aligned_fraction", 0.30))
+DREP_ALGORITHM = str(DREP_CONFIG.get("secondary_algorithm", "fastANI"))
+
+GTDB_CONFIG = config.get("gtdbtk", {})
+GTDB_PPLACER_CPUS = int(GTDB_CONFIG.get("pplacer_cpus", min(4, THREADS)))
+GTDB_SCRATCH_DIR = str(GTDB_CONFIG.get("scratch_dir", f"{OUTPUT_ROOT}/tmp/gtdbtk"))
+
+PRODIGAL_CONFIG = config.get("prodigal", {})
+PRODIGAL_MODE = str(PRODIGAL_CONFIG.get("mode", "auto")).lower()
+
+COVERM_CONFIG = config.get("coverm_options", {})
+COVERM_MIN_COVERED_FRACTION = float(COVERM_CONFIG.get("min_covered_fraction", 0.30))
+COVERM_MIN_IDENTITY = float(COVERM_CONFIG.get("min_read_percent_identity", 95.0))
+COVERM_MIN_ALIGNED = float(COVERM_CONFIG.get("min_read_aligned_percent", 75.0))
+COVERM_MAPPER = str(COVERM_CONFIG.get("mapper", "minimap2-sr"))
+
+FASTP_R1 = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq.gz"
+FASTP_R2 = f"{FASTP_DIR}/{SAMPLE}_2.clean.fastq.gz"
+FASTP_SINGLETONS = f"{FASTP_DIR}/{SAMPLE}_singletons.clean.fastq.gz"
+HOST_R1 = f"{HOST_DIR}/{SAMPLE}_paired_1.fastq.gz"
+HOST_R2 = f"{HOST_DIR}/{SAMPLE}_paired_2.fastq.gz"
+HOST_SINGLETONS = f"{HOST_DIR}/{SAMPLE}_singletons.fastq.gz"
+CLEAN_R1 = HOST_R1 if HOST_ENABLED else FASTP_R1
+CLEAN_R2 = HOST_R2 if HOST_ENABLED else FASTP_R2
+CLEAN_SINGLETONS = HOST_SINGLETONS if HOST_ENABLED else FASTP_SINGLETONS
+CONTIGS = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa"
+MAPPING_BAM = f"{MAP_DIR}/{SAMPLE}.sorted.bam"
+MAPPING_BAI = f"{MAP_DIR}/{SAMPLE}.sorted.bam.bai"
+DEPTH_FILE = f"{MAP_DIR}/{SAMPLE}_depth.txt"
+REFINED_BINS = f"{BIN_DIR}/{SAMPLE}/dastool_bins"
+QUALITY_MATRIX = f"{MAG_QC_DIR}/{SAMPLE}/mag_quality_matrix.tsv"
+PRODUCTION_MAGS = f"{FILTERED_DIR}/{SAMPLE}/production_mags"
+ARCHIVED_MAGS = f"{FILTERED_DIR}/{SAMPLE}/archived_mags"
+DREP_OUTPUT = f"{DREP_DIR}/{SAMPLE}_drep_output"
+DREP_DONE = f"{DREP_DIR}/{SAMPLE}.drep.done"
+GTDB_OUTPUT = f"{GTDB_DIR}/{SAMPLE}"
+GTDB_DONE = f"{GTDB_DIR}/{SAMPLE}.gtdbtk.done"
+
+
+def representative_mag_ids(wildcards):
+    checkpoint_dir = checkpoints.drep.get().output.out_dir
+    pattern = os.path.join(str(checkpoint_dir), "dereplicated_genomes", "{mag}.fa")
+    return sorted(glob_wildcards(pattern).mag)
+
+def prokka_all_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff", sample=wildcards.sample, mag=mags)
+
+def cctyper_all_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done", sample=wildcards.sample, mag=mags)
+
+def dbcan_all_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done", sample=wildcards.sample, mag=mags)
+
+def dram_all_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{DRAM_DIR}/{{sample}}/{{mag}}/dram.done", sample=wildcards.sample, mag=mags)
+
+def abricate_mag_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv", sample=wildcards.sample, db=wildcards.db, mag=mags)
+
+def hadeg_mag_inputs(wildcards):
+    mags = representative_mag_ids(wildcards)
+    return expand(f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa", sample=wildcards.sample, mag=mags)
+
+
+BASE_FINAL_TARGETS = [
+    f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{NONPAREIL_DIR}/{SAMPLE}.npo",
+    f"{METAPHLAN_DIR}/{SAMPLE}_profile.txt",
+    f"{ASSEMBLY_QC_DIR}/{SAMPLE}/report.html",
+    QUALITY_MATRIX,
+    DREP_DONE,
+    GTDB_DONE,
+    f"{ANNOTATION_DIR}/{SAMPLE}/representative_proteins.faa",
+    f"{COVERM_DIR}/{SAMPLE}/abundance_matrix.tsv",
+]
+
+if RUN_KRAKEN:
+    BASE_FINAL_TARGETS.append(f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv")
+if RUN_VIRSORTER2:
+    BASE_FINAL_TARGETS.append(f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done")
+
+OPTIONAL_ANNOTATION_TARGETS = []
+if RUN_PROKKA: OPTIONAL_ANNOTATION_TARGETS.append(f"{PROKKA_DIR}/{SAMPLE}/prokka.done")
+if RUN_CCTYPER: OPTIONAL_ANNOTATION_TARGETS.append(f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done")
+if RUN_DBCAN: OPTIONAL_ANNOTATION_TARGETS.append(f"{DBCAN_DIR}/{SAMPLE}/dbcan.done")
+if RUN_DRAM: OPTIONAL_ANNOTATION_TARGETS.append(f"{DRAM_DIR}/{SAMPLE}/dram.done")
+if RUN_ABRICATE: OPTIONAL_ANNOTATION_TARGETS.append(f"{ABRICATE_DIR}/{SAMPLE}/abricate.done")
+if RUN_HADEG: OPTIONAL_ANNOTATION_TARGETS.append(f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done")
+
+MULTIQC_INPUTS = [
+    f"{FASTP_DIR}/{SAMPLE}_fastp.json",
+    f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{ASSEMBLY_QC_DIR}/{SAMPLE}/report.tsv",
+    MAPPING_BAM,
+    QUALITY_MATRIX,
+    DREP_DONE,
+    GTDB_DONE,
+    *OPTIONAL_ANNOTATION_TARGETS,
+]
+if RUN_KRAKEN:
+    MULTIQC_INPUTS.append(f"{KRAKEN_DIR}/{SAMPLE}_kraken2_report.tsv")
+if RUN_VIRSORTER2:
+    MULTIQC_INPUTS.append(f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done")
+
+FINAL_TARGETS = BASE_FINAL_TARGETS + OPTIONAL_ANNOTATION_TARGETS
+if RUN_MULTIQC: FINAL_TARGETS.append(f"{MULTIQC_DIR}/multiqc_report.html")
+
+wildcard_constraints:
+    sample=re.escape(SAMPLE),
+    mag=r"[^/]+",
+    db="(?:" + "|".join(re.escape(db) for db in ABRICATE_DBS) + ")",
+
+
+# =============================================================================
+# EXECUTABLE TARGET ENGINE MASTER REGISTER
+# =============================================================================
+rule all:
+    input: FINAL_TARGETS
+
+rule fastqc_raw:
+    input: r1=RAW_R1, r2=RAW_R2
+    output:
+        html_r1=f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.html", zip_r1=f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.zip",
+        html_r2=f"{RAW_QC_DIR}/{SAMPLE}_R2_fastqc.html", zip_r2=f"{RAW_QC_DIR}/{SAMPLE}_R2_fastqc.zip"
+    log: f"{LOG_DIR}/fastqc_raw/{SAMPLE}.log"
+    threads: 2
+    run:
+        run_fastqc([input.r1, input.r2], [output.html_r1, output.zip_r1, output.html_r2, output.zip_r2], log[0], threads)
+
+rule fastp_clean:
+    input: r1=RAW_R1, r2=RAW_R2
+    output:
+        r1=FASTP_R1, r2=FASTP_R2,
+        singleton1=temp(f"{FASTP_DIR}/{SAMPLE}_unpaired_1.fastq.gz"),
+        singleton2=temp(f"{FASTP_DIR}/{SAMPLE}_unpaired_2.fastq.gz"),
+        singletons=FASTP_SINGLETONS,
+        json=f"{FASTP_DIR}/{SAMPLE}_fastp.json", html=f"{FASTP_DIR}/{SAMPLE}_fastp.html"
+    log: f"{LOG_DIR}/fastp/{SAMPLE}.log"
+    threads: THREADS
+    resources: mem_mb=8000, runtime=RUNTIME_MIN
+    run:
+        Path(FASTP_DIR).mkdir(parents=True, exist_ok=True)
+        command = [
+            FASTP, "--in1", input.r1, "--in2", input.r2, "--out1", output.r1, "--out2", output.r2,
+            "--unpaired1", output.singleton1, "--unpaired2", output.singleton2,
+            "--json", output.json, "--html", output.html,
+            "--qualified_quality_phred", str(FASTP_QUALIFIED_Q),
+            "--unqualified_percent_limit", str(FASTP_MAX_UNQUALIFIED),
+            "--n_base_limit", str(FASTP_N_BASE_LIMIT),
+            "--length_required", str(FASTP_MIN_LENGTH),
+            "--cut_front", "--cut_tail",
+            "--cut_front_window_size", str(FASTP_CUT_WINDOW),
+            "--cut_front_mean_quality", str(FASTP_CUT_MEAN_Q),
+            "--cut_tail_window_size", str(FASTP_CUT_WINDOW),
+            "--cut_tail_mean_quality", str(FASTP_CUT_MEAN_Q),
+            "--detect_adapter_for_pe", "--thread", str(threads),
+            *FASTP_POLY_G_FLAGS,
+        ]
+        run_command(command, log[0])
+        with open(output.singletons, "wb") as merged:
+            for singleton in (output.singleton1, output.singleton2):
+                with open(singleton, "rb") as source: shutil.copyfileobj(source, merged)
+
+rule host_decontaminate:
+    input: r1=FASTP_R1, r2=FASTP_R2, singletons=FASTP_SINGLETONS
+    output: r1=HOST_R1, r2=HOST_R2, singletons=HOST_SINGLETONS
+    log: f"{LOG_DIR}/host_removal/{SAMPLE}.log"
+    threads: THREADS
+    resources: mem_mb=MEMORY_MB, runtime=RUNTIME_MIN
+    run:
+        if not HOST_ENABLED: raise ValueError("host_decontaminate requested but disabled")
+        Path(HOST_DIR).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"{SAMPLE}_host_", dir=HOST_DIR) as workdir:
+            input_dir, paired_dir, single_dir = Path(workdir)/"input", Path(workdir)/"paired", Path(workdir)/"single"
+            input_dir.mkdir(); paired_dir.mkdir(); single_dir.mkdir()
+            paired_r1, paired_r2 = input_dir/f"{SAMPLE}_R1.trimmed.fastq", input_dir/f"{SAMPLE}_R2.trimmed.fastq"
+            with gzip.open(input.r1, "rb") as source, open(paired_r1, "wb") as target: shutil.copyfileobj(source, target)
+            with gzip.open(input.r2, "rb") as source, open(paired_r2, "wb") as target: shutil.copyfileobj(source, target)
+            
+            # Using env path resolving
+            env = os.environ.copy()
+            env["PATH"] = KNEADDATA_ENV + os.pathsep + env.get("PATH", "")
+            
+            paired_command = [
+                KNEADDATA, "--input1", str(paired_r1), "--input2", str(paired_r2),
+                "--output", str(paired_dir), "--output-prefix", SAMPLE,
+                "--reference-db", str(HOST_DB), "--threads", str(threads),
+                "--bypass-trim", "--bypass-trf", "--log", log[0],
+            ]
+            if HOST_BOWTIE2_OPTIONS: paired_command.append(f"--bowtie2-options={HOST_BOWTIE2_OPTIONS}")
+            subprocess.run(paired_command, env=env, check=True)
+            
+            paired_1 = first_existing([paired_dir/f"{SAMPLE}_paired_1.fastq", paired_dir/f"{SAMPLE}_kneaddata_paired_1.fastq"])
+            paired_2 = first_existing([paired_dir/f"{SAMPLE}_paired_2.fastq", paired_dir/f"{SAMPLE}_kneaddata_paired_2.fastq"])
+            for source, target in ((paired_1, output.r1), (paired_2, output.r2)):
+                with open(target, "wb") as compressed:
+                    subprocess.run([PIGZ, "-p", str(threads), "-c", str(source)], stdout=compressed, check=True)
+
+            singleton_sources = []
+            if gzip_has_data(input.singletons):
+                singleton_input = input_dir/f"{SAMPLE}_singletons.trimmed.fastq"
+                with gzip.open(input.singletons, "rb") as source, open(singleton_input, "wb") as target: shutil.copyfileobj(source, target)
+                single_command = [
+                    KNEADDATA, "--unpaired", str(singleton_input), "--output", str(single_dir),
+                    "--output-prefix", f"{SAMPLE}_singletons", "--reference-db", str(HOST_DB),
+                    "--threads", str(threads), "--bypass-trim", "--bypass-trf", "--log", str(Path(workdir)/"singletons.log"),
+                ]
+                subprocess.run(single_command, env=env, check=True)
+                singleton_final = next((candidate for candidate in (single_dir/f"{SAMPLE}_singletons.fastq", single_dir/f"{SAMPLE}_singletons_kneaddata.fastq") if candidate.is_file()), None)
+                if singleton_final: singleton_sources.append(singleton_final)
+            
+            combined_singletons = Path(workdir)/"singletons.fastq"
+            with open(combined_singletons, "wb") as target:
+                for source in singleton_sources:
+                    with open(source, "rb") as handle: shutil.copyfileobj(handle, target)
+            with open(output.singletons, "wb") as compressed:
+                subprocess.run([PIGZ, "-p", str(threads), "-c", str(combined_singletons)], stdout=compressed, check=True)
+
+rule fastqc_clean:
+    input: r1=CLEAN_R1, r2=CLEAN_R2
+    output:
+        html_r1=f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.html", zip_r1=f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.zip",
+        html_r2=f"{CLEAN_QC_DIR}/{SAMPLE}_R2_fastqc.html", zip_r2=f"{CLEAN_QC_DIR}/{SAMPLE}_R2_fastqc.zip"
+    log: f"{LOG_DIR}/fastqc_clean/{SAMPLE}.log"
+    threads: 2
+    run: run_fastqc([input.r1, input.r2], [output.html_r1, output.zip_r1, output.html_r2, output.zip_r2], log[0], threads)
+
+rule nonpareil:
+    input: r1=CLEAN_R1
+    output:
+        npa=f"{NONPAREIL_DIR}/{SAMPLE}.npa", npc=f"{NONPAREIL_DIR}/{SAMPLE}.npc",
+        npl=f"{NONPAREIL_DIR}/{SAMPLE}.npl", npo=f"{NONPAREIL_DIR}/{SAMPLE}.npo"
+    log: f"{LOG_DIR}/nonpareil/{SAMPLE}.log"
+    threads: THREADS
+    shell:
+        r"""
+        mkdir -p "{NONPAREIL_DIR}" "$(dirname "{log}")"
+        if [[ "{input.r1}" == *.gz ]]; then
+            zcat "{input.r1}" > "{NONPAREIL_DIR}/{SAMPLE}_temp.fastq"
+            "{NONPAREIL}" -s "{NONPAREIL_DIR}/{SAMPLE}_temp.fastq" -T kmer -f fastq -b "{NONPAREIL_DIR}/{SAMPLE}" -t {threads} > "{log}" 2>&1
+            rm -f "{NONPAREIL_DIR}/{SAMPLE}_temp.fastq"
+        else
+            "{NONPAREIL}" -s "{input.r1}" -T kmer -f fastq -b "{NONPAREIL_DIR}/{SAMPLE}" -t {threads} > "{log}" 2>&1
+        fi
+        """
+
+rule metaphlan:
+    input: r1=CLEAN_R1, r2=CLEAN_R2, singletons=CLEAN_SINGLETONS
+    output: profile=f"{METAPHLAN_DIR}/{SAMPLE}_profile.txt", bowtie2=f"{METAPHLAN_DIR}/{SAMPLE}.bowtie2.bz2"
+    log: f"{LOG_DIR}/metaphlan/{SAMPLE}.log"
+    threads: max(1, THREADS // 2)
+    resources: mem_mb=32000, runtime=RUNTIME_MIN
+    run:
+        Path(METAPHLAN_DIR).mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = METAPHLAN_ENV + os.pathsep + env.get("PATH", "")
+        reads = [input.r1, input.r2]
+        if gzip_has_data(input.singletons): reads.append(input.singletons)
+        command = [
+            METAPHLAN, ",".join(reads), "--input_type", "fastq",
+            "--bowtie2db", METAPHLAN_DB, "-x", METAPHLAN_INDEX,
+            "--bowtie2_exe", BOWTIE2_META, "--bowtie2out", output.bowtie2,
+            "--nproc", str(threads), "--offline", "-o", output.profile,
+        ]
+        with open(log[0], "wb") as log_handle:
+            subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+
+rule megahit:
+    input: r1=CLEAN_R1, r2=CLEAN_R2, singletons=CLEAN_SINGLETONS
+    output: contigs=CONTIGS
+    log: f"{LOG_DIR}/megahit/{SAMPLE}.log"
+    threads: max(1, THREADS // 2)
+    resources: mem_mb=MEMORY_MB, runtime=RUNTIME_MIN
+    run:
+        Path(ASSEMBLY_DIR).mkdir(parents=True, exist_ok=True)
+        workdir = f"{ASSEMBLY_DIR}/megahit_{SAMPLE}"
+        shutil.rmtree(workdir, ignore_errors=True)
+        command = [
+            MEGAHIT, "-1", input.r1, "-2", input.r2, "-o", workdir, "-t", str(threads),
+            "--min-contig-len", str(ASSEMBLY_MIN_CONTIG), "--memory", str(MEGAHIT_MEMORY),
+        ]
+        if gzip_has_data(input.singletons): command.extend(["-r", input.singletons])
+        if MEGAHIT_PRESET != "default": command.extend(["--presets", MEGAHIT_PRESET])
+        run_command(command, log[0])
+        shutil.copyfile(os.path.join(workdir, "final.contigs.fa"), output.contigs)
+
+rule assembly_qc:
+    input: contigs=CONTIGS, r1=CLEAN_R1, r2=CLEAN_R2, singletons=CLEAN_SINGLETONS
+    output: html=f"{ASSEMBLY_QC_DIR}/{SAMPLE}/report.html", tsv=f"{ASSEMBLY_QC_DIR}/{SAMPLE}/report.tsv"
+    log: f"{LOG_DIR}/assembly_qc/{SAMPLE}.log"
+    threads: THREADS
+    resources: mem_mb=MEMORY_MB, runtime=RUNTIME_MIN
+    run:
+        outdir = f"{ASSEMBLY_QC_DIR}/{SAMPLE}"
+        shutil.rmtree(outdir, ignore_errors=True)
+        env = os.environ.copy()
+        env["PATH"] = QUAST_ENV + os.pathsep + env.get("PATH", "")
+        command = [
+            QUAST, input.contigs, "--pe1", input.r1, "--pe2", input.r2,
+            "--min-contig", str(ASSEMBLY_MIN_CONTIG), "--threads", str(threads), "--output-dir", outdir, "--no-sv",
+        ]
+        if gzip_has_data(input.singletons): command.extend(["--single", input.singletons])
+        with open(log[0], "wb") as log_handle:
+            subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+
+rule bowtie2_index:
+    input: contigs=CONTIGS
+    output: index_dir=directory(f"{MAP_DIR}/{SAMPLE}_index")
+    log: f"{LOG_DIR}/mapping/{SAMPLE}.bowtie2_build.log"
+    threads: THREADS
+    run:
+        shutil.rmtree(output.index_dir, ignore_errors=True)
+        Path(output.index_dir).mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = MAPPING_ENV + os.pathsep + env.get("PATH", "")
+        with open(log[0], "wb") as log_handle:
+            subprocess.run([BOWTIE2_BUILD, "--threads", str(threads), input.contigs, os.path.join(output.index_dir, "index")], stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+
+rule bowtie2_map:
+    input: r1=CLEAN_R1, r2=CLEAN_R2, singletons=CLEAN_SINGLETONS, index_dir=f"{MAP_DIR}/{SAMPLE}_index"
+    output: bam=MAPPING_BAM, bai=MAPPING_BAI
+    log: f"{LOG_DIR}/mapping/{SAMPLE}.bowtie2.log"
+    threads: THREADS
+    run:
+        Path(MAP_DIR).mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        align_threads = max(1, threads // 2)
+        sort_threads = max(1, threads - align_threads)
+        singleton = f" -U {shlex.quote(input.singletons)}" if gzip_has_data(input.singletons) else ""
+        command = (
+            f"export PATH={MAPPING_ENV}:$PATH; set -euo pipefail; "
+            f"{shlex.quote(BOWTIE2)} --very-sensitive -x {shlex.quote(os.path.join(input.index_dir, 'index'))} "
+            f"-1 {shlex.quote(input.r1)} -2 {shlex.quote(input.r2)}{singleton} "
+            f"-p {align_threads} --no-unal 2> {shlex.quote(log[0])} | "
+            f"{shlex.quote(SAMTOOLS)} sort -@ {sort_threads} -o {shlex.quote(output.bam)} - "
+            f">> {shlex.quote(log[0])} 2>&1; "
+            f"{shlex.quote(SAMTOOLS)} index -@ {sort_threads} {shlex.quote(output.bam)} {shlex.quote(output.bai)}"
+        )
+        subprocess.run(["bash", "-c", command], check=True)
+
+rule calculate_depth:
+    input: bam=MAPPING_BAM, bai=MAPPING_BAI
+    output: depth=DEPTH_FILE
+    log: f"{LOG_DIR}/mapping/{SAMPLE}.depth.log"
+    threads: 1
+    shell:
+        r"""
+        export PATH={BINNING_ENV}:{MAPPING_ENV}:$PATH
+        mkdir -p "$(dirname "{log}")"
+        "{JGI_DEPTH}" --outputDepth "{output.depth}" "{input.bam}" > "{log}" 2>&1
+        """
+
+rule metabat2:
+    input: contigs=CONTIGS, depth=DEPTH_FILE
+    output: bins=directory(f"{BIN_DIR}/{SAMPLE}/metabat2_bins"), tsv=f"{BIN_DIR}/{SAMPLE}/metabat2.tsv"
+    log: f"{LOG_DIR}/binning/{SAMPLE}.metabat2.log"
+    threads: THREADS
+    run:
+        shutil.rmtree(output.bins, ignore_errors=True)
+        Path(output.bins).mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = BINNING_ENV + os.pathsep + env.get("PATH", "")
+        command = [
+            METABAT2, "-i", input.contigs, "-a", input.depth, "-o", os.path.join(output.bins, "bin"),
+            "--minContig", str(METABAT_MIN_CONTIG), "--minCV", str(METABAT_MIN_CV),
+            "--minCVSum", str(METABAT_MIN_CV_SUM), "--seed", str(METABAT_SEED), "-t", str(threads),
+        ]
+        with open(log[0], "wb") as log_handle:
+            subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        write_contig2bin(output.bins, output.tsv)
+
+rule semibin2:
+    input: contigs=CONTIGS, bam=MAPPING_BAM, bai=MAPPING_BAI
+    output: bins=directory(f"{BIN_DIR}/{SAMPLE}/semibin2_bins"), tsv=f"{BIN_DIR}/{SAMPLE}/semibin2.tsv"
+    log: f"{LOG_DIR}/binning/{SAMPLE}.semibin2.log"
+    threads: THREADS
+    run:
+        Path(f"{BIN_DIR}/{SAMPLE}").mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = BINNING_ENV + os.pathsep + env.get("PATH", "")
+        with tempfile.TemporaryDirectory(prefix="semibin2_", dir=f"{BIN_DIR}/{SAMPLE}") as workdir:
+            command = [
+                SEMIBIN2, "single_easy_bin", "--input-fasta", input.contigs, "--input-bam", input.bam,
+                "--output", workdir, "--threads", str(threads), "--min-len", str(SEMIBIN_MIN_CONTIG),
+            ]
+            if SEMIBIN_USE_PRETRAINED: command.extend(["--environment", SEMIBIN_ENVIRONMENT])
+            with open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+            
+            # Debug traces for output directory structure diagnostics
+            import sys
+            print(f"DEBUG SEMIBIN2: workdir is {workdir}", file=sys.stderr)
+            for root, dirs, files in os.walk(workdir):
+                print(f"DEBUG SEMIBIN2: walk {root} -> dirs: {dirs}, files: {files}", file=sys.stderr)
+                
+            candidates = []
+            for dirname in (".", "output_recluster_bins", "output_bins"):
+                candidate_dir = Path(workdir) / dirname
+                if candidate_dir.is_dir():
+                    candidates.extend(candidate_dir.glob("*.fa"))
+                    candidates.extend(candidate_dir.glob("*.fasta"))
+            print(f"DEBUG SEMIBIN2: Candidates list: {candidates}", file=sys.stderr)
+            normalize_bins(candidates, output.bins)
+        write_contig2bin(output.bins, output.tsv)
+
+rule maxbin2:
+    input: contigs=CONTIGS, depth=DEPTH_FILE
+    output: bins=directory(f"{BIN_DIR}/{SAMPLE}/maxbin2_bins"), tsv=f"{BIN_DIR}/{SAMPLE}/maxbin2.tsv"
+    log: f"{LOG_DIR}/binning/{SAMPLE}.maxbin2.log"
+    threads: THREADS
+    run:
+        Path(f"{BIN_DIR}/{SAMPLE}").mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = BINNING_ENV + os.pathsep + env.get("PATH", "")
+        env["PERL5LIB"] = f"{str(Path(BINNING_ENV).parent)}/lib/perl5" + (":" + env["PERL5LIB"] if "PERL5LIB" in env else "")
+        with tempfile.TemporaryDirectory(prefix="maxbin2_", dir=f"{BIN_DIR}/{SAMPLE}") as workdir:
+            abundance = os.path.join(workdir, "abundance.tsv")
+            with open(input.depth) as source, open(abundance, "w") as target:
+                next(source, None)
+                for line in source:
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) >= 3: target.write(f"{fields[0]}\t{fields[2]}\n")
+            command = [
+                MAXBIN2, "-contig", input.contigs, "-abund", abundance, "-out", os.path.join(workdir, "bin"),
+                "-min_contig_length", str(MAXBIN_MIN_CONTIG), "-thread", str(threads),
+            ]
+            with open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+            candidates = list(Path(workdir).glob("bin.*.fasta"))
+            normalize_bins(candidates, output.bins)
+        write_contig2bin(output.bins, output.tsv)
+
+rule das_tool:
+    input:
+        metabat=f"{BIN_DIR}/{SAMPLE}/metabat2.tsv", semibin=f"{BIN_DIR}/{SAMPLE}/semibin2.tsv",
+        maxbin=f"{BIN_DIR}/{SAMPLE}/maxbin2.tsv", contigs=CONTIGS
+    output: bins=directory(REFINED_BINS), summary=f"{BIN_DIR}/{SAMPLE}/dastool_summary.tsv"
+    log: f"{LOG_DIR}/binning/{SAMPLE}.dastool.log"
+    threads: THREADS
+    run:
+        available = []
+        for label, path in (("metabat2", input.metabat), ("semibin2", input.semibin), ("maxbin2", input.maxbin)):
+            if os.path.isfile(path) and os.path.getsize(path) > 0: available.append((label, path))
+        shutil.rmtree(output.bins, ignore_errors=True)
+        Path(output.bins).mkdir(parents=True, exist_ok=True)
+        Path(output.summary).parent.mkdir(parents=True, exist_ok=True)
+        if not available:
+            with open(output.summary, "w") as handle: handle.write("bin\tunique_bacterial_single_copy_genes\tduplicate_bacterial_single_copy_genes\n")
+        else:
+            env = os.environ.copy()
+            env["PATH"] = BINNING_ENV + os.pathsep + env.get("PATH", "")
+            with tempfile.TemporaryDirectory(prefix="dastool_", dir=f"{BIN_DIR}/{SAMPLE}") as workdir:
+                prefix = os.path.join(workdir, "refined")
+                command = [
+                    DASTOOL, "-i", ",".join(path for _, path in available), "-l", ",".join(label for label, _ in available),
+                    "-c", input.contigs, "-o", prefix, "--write_bins", "--score_threshold", str(DASTOOL_SCORE), "-t", str(threads),
+                ]
+                with open(log[0], "wb") as log_handle:
+                    subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+                source_bins = f"{prefix}_DASTool_bins"
+                candidates = []
+                if os.path.isdir(source_bins):
+                    for extension in ("*.fa", "*.fasta", "*.fna"): candidates.extend(Path(source_bins).glob(extension))
+                normalize_bins(candidates, output.bins)
+                source_summary = f"{prefix}_DASTool_summary.txt"
+                if os.path.isfile(source_summary): shutil.copyfile(source_summary, output.summary)
+                else:
+                    with open(output.summary, "w") as handle: handle.write("bin\tunique_bacterial_single_copy_genes\tduplicate_bacterial_single_copy_genes\n")
+
+rule checkm2:
+    input: bins=REFINED_BINS
+    output: report=f"{MAG_QC_DIR}/{SAMPLE}/checkm2_quality_report.tsv"
+    log: f"{LOG_DIR}/mag_qc/{SAMPLE}.checkm2.log"
+    threads: THREADS
+    run:
+        Path(output.report).parent.mkdir(parents=True, exist_ok=True)
+        bins = sorted(Path(input.bins).glob("*.fa"))
+        if not bins:
+            with open(output.report, "w") as handle: handle.write("Name\tCompleteness\tContamination\n")
+        else:
+            env = os.environ.copy()
+            env["PATH"] = CHECKM2_ENV + os.pathsep + PROKKA_ENV + os.pathsep + env.get("PATH", "")
+            with tempfile.TemporaryDirectory(prefix="checkm2_", dir=str(Path(output.report).parent)) as workdir:
+                command = [
+                    CHECKM2, "predict", "--input", input.bins, "--output-directory", workdir,
+                    "--threads", str(threads), "-x", "fa", "--force", "--database_path", CHECKM2_DB,
+                ]
+                if CHECKM2_LOWMEM: command.append("--lowmem")
+                with open(log[0], "wb") as log_handle:
+                    subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+                shutil.copyfile(os.path.join(workdir, "quality_report.tsv"), output.report)
+
+rule gunc:
+    input: bins=REFINED_BINS
+    output: report=f"{MAG_QC_DIR}/{SAMPLE}/gunc_maxcss.tsv"
+    log: f"{LOG_DIR}/mag_qc/{SAMPLE}.gunc.log"
+    threads: THREADS
+    run:
+        Path(output.report).parent.mkdir(parents=True, exist_ok=True)
+        bins = sorted(Path(input.bins).glob("*.fa"))
+        if not bins:
+            with open(output.report, "w") as handle: handle.write("genome\tclade_separation_score\tpass.GUNC\n")
+        else:
+            env = os.environ.copy()
+            env["PATH"] = str(Path(GUNC).parent) + os.pathsep + env.get("PATH", "")
+            with tempfile.TemporaryDirectory(prefix="gunc_", dir=str(Path(output.report).parent)) as workdir:
+                outdir, tempdir = os.path.join(workdir, "output"), os.path.join(workdir, "tmp")
+                os.makedirs(outdir); os.makedirs(tempdir)
+                command = [
+                    GUNC, "run", "--input_dir", input.bins, "--file_suffix", ".fa",
+                    "--db_file", GUNC_DB, "--threads", str(threads), "--min_mapped_genes", str(GUNC_MIN_MAPPED_GENES),
+                    "--temp_dir", tempdir, "--out_dir", outdir,
+                ]
+                if GUNC_SENSITIVE: command.append("--sensitive")
+                with open(log[0], "wb") as log_handle:
+                    subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+                shutil.copyfile(sorted(Path(outdir).glob("GUNC.*.maxCSS_level.tsv"))[0], output.report)
+
+rule structural_mag_qc:
+    input: bins=REFINED_BINS
+    output: summary=f"{MAG_QC_DIR}/{SAMPLE}/structural_qc.tsv"
+    log: f"{LOG_DIR}/mag_qc/{SAMPLE}.structural.log"
+    threads: THREADS
+    run:
+        detail_root = Path(f"{MAG_QC_DIR}/{SAMPLE}/structural_details")
+        shutil.rmtree(detail_root, ignore_errors=True); detail_root.mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        
+        env = os.environ.copy()
+        env["PATH"] = PROKKA_ENV + os.pathsep + env.get("PATH", "")
+
+        def process_mag(fasta):
+            mag = clean_mag_id(fasta.name)
+            mag_dir = detail_root / mag
+            mag_dir.mkdir(parents=True, exist_ok=True)
+            bac_gff, arc_gff = mag_dir / "barrnap_bacteria.gff", mag_dir / "barrnap_archaea.gff"
+            with open(bac_gff, "w") as out_h, open(mag_dir / "barrnap_bacteria.log", "w") as err_h:
+                subprocess.run([BARRNAP, "--kingdom", "bac", "--threads", "1", str(fasta)], stdout=out_h, stderr=err_h, env=env, check=False)
+            with open(arc_gff, "w") as out_h, open(mag_dir / "barrnap_archaea.log", "w") as err_h:
+                subprocess.run([BARRNAP, "--kingdom", "arc", "--threads", "1", str(fasta)], stdout=out_h, stderr=err_h, env=env, check=False)
+            
+            def rrna_profile(gff_path):
+                profile = {"5S": False, "16S": False, "23S": False}
+                if os.path.isfile(gff_path):
+                    with open(gff_path) as handle:
+                        for line in handle:
+                            if not line.startswith("#") and "(partial)" not in line:
+                                for name in profile:
+                                    if f"Name={name}_rRNA" in line: profile[name] = True
+                return profile
+
+            bac_rrna, arc_rrna = rrna_profile(bac_gff), rrna_profile(arc_gff)
+            selected_domain = "Bacteria" if sum(bac_rrna.values()) >= sum(arc_rrna.values()) else "Archaea"
+            sel_rrna = bac_rrna if selected_domain == "Bacteria" else arc_rrna
+            
+            metrics = fasta_metrics(fasta)
+            metrics.update({
+                "MAG": mag, "structural_domain": selected_domain,
+                "structural_complete": all(sel_rrna.values()),
+                "bacterial_structural_complete": all(bac_rrna.values()),
+                "archaeal_structural_complete": all(arc_rrna.values()),
+                "has_5S": sel_rrna["5S"], "has_16S": sel_rrna["16S"], "has_23S": sel_rrna["23S"],
+                "trna_isotype_count": 0,
+            })
+            return metrics
+
+        bins = sorted(Path(input.bins).glob("*.fa"))
+        rows = []
+        with ThreadPoolExecutor(max_workers=max(1, threads // 2)) as executor:
+            futures = {executor.submit(process_mag, fasta): fasta for fasta in bins}
+            for future in as_completed(futures): rows.append(future.result())
+        rows.sort(key=lambda row: row["MAG"])
+        
+        fields = ["MAG", "contig_count", "total_length", "n50", "gc_percent", "structural_domain", "structural_complete", "bacterial_structural_complete", "archaeal_structural_complete", "has_5S", "has_16S", "has_23S", "trna_isotype_count"]
+        Path(output.summary).parent.mkdir(parents=True, exist_ok=True)
+        with open(output.summary, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
+            writer.writeheader(); writer.writerows(rows)
+        with open(log[0], "w") as handle: handle.write(f"Processed {len(rows)} MAGs\n")
+
+rule merge_mag_qc:
+    input: bins=REFINED_BINS, checkm2=f"{MAG_QC_DIR}/{SAMPLE}/checkm2_quality_report.tsv", gunc=f"{MAG_QC_DIR}/{SAMPLE}/gunc_maxcss.tsv", structural=f"{MAG_QC_DIR}/{SAMPLE}/structural_qc.tsv"
+    output: matrix=QUALITY_MATRIX
+    log: f"{LOG_DIR}/mag_qc/{SAMPLE}.merge.log"
+    run:
+        checkm, gunc, structural = {}, {}, {}
+        with open(input.checkm2) as h:
+            for r in csv.DictReader(h, delimiter="\t"):
+                if name_key := next((k for k in ("Name", "name", "Bin Id", "Bin_Id", "Genome") if k in r), None):
+                    checkm[clean_mag_id(r[name_key])] = {"checkm2_completeness": parse_float(r.get("Completeness")), "checkm2_contamination": parse_float(r.get("Contamination"))}
+        with open(input.gunc) as h:
+            for r in csv.DictReader(h, delimiter="\t"):
+                if "genome" in r: gunc[clean_mag_id(r["genome"])] = {"gunc_pass": parse_bool(r.get("pass.GUNC")), "gunc_css": parse_float(r.get("clade_separation_score")), "gunc_reference_representation_score": parse_float(r.get("reference_representation_score"))}
+        with open(input.structural) as h:
+            for r in csv.DictReader(h, delimiter="\t"):
+                structural[clean_mag_id(r["MAG"])] = {k: parse_bool(r.get(k)) if "complete" in k or "has" in k else r.get(k) for k in r.keys() if k != "MAG"}
+        
+        rows = []
+        for fasta in sorted(Path(input.bins).glob("*.fa")):
+            mag = clean_mag_id(fasta.name)
+            row = {"MAG": mag}
+            row.update(checkm.get(mag, {"checkm2_completeness": None, "checkm2_contamination": None}))
+            row.update(gunc.get(mag, {"gunc_pass": None, "gunc_css": None, "gunc_reference_representation_score": None}))
+            row.update(structural.get(mag, {"structural_complete": False}))
+            
+            c, ct, hs = row["checkm2_completeness"], row["checkm2_contamination"], row.get("structural_complete")
+            if c is None or ct is None: tier = "Unassessed"
+            elif c > HIGH_COMPLETENESS and ct < HIGH_CONTAMINATION and hs: tier = "High-quality draft MAG"
+            elif c >= MEDIUM_COMPLETENESS and ct < MEDIUM_CONTAMINATION: tier = "Medium-quality draft MAG"
+            else: tier = "Low-quality draft MAG"
+            
+            eligible = tier in {"High-quality draft MAG", "Medium-quality draft MAG"}
+            reasons = []
+            if not eligible: reasons.append("quality_threshold")
+            if REQUIRE_GUNC_PASS and row.get("gunc_pass") is not True: eligible = False; reasons.append("gunc_not_passed")
+            
+            row.update({"mimag_inspired_tier": tier, "production_eligible": eligible, "exclusion_reason": ";".join(reasons)})
+            rows.append(row)
+            
+        Path(output.matrix).parent.mkdir(parents=True, exist_ok=True)
+        with open(output.matrix, "w", newline="") as h:
+            headers = [
+                "MAG", "checkm2_completeness", "checkm2_contamination", "gunc_pass", 
+                "gunc_css", "gunc_reference_representation_score", "structural_complete",
+                "mimag_inspired_tier", "production_eligible", "exclusion_reason"
+            ]
+            if rows:
+                headers = list(rows[0].keys())
+            writer = csv.DictWriter(h, fieldnames=headers, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            if rows:
+                writer.writerows(rows)
+
+rule mag_filter:
+    input: matrix=QUALITY_MATRIX, bins=REFINED_BINS
+    output: production=directory(PRODUCTION_MAGS), archive=directory(ARCHIVED_MAGS), done=f"{FILTERED_DIR}/{SAMPLE}.filter.done"
+    run:
+        shutil.rmtree(output.production, ignore_errors=True); shutil.rmtree(output.archive, ignore_errors=True)
+        Path(output.production).mkdir(parents=True, exist_ok=True); Path(output.archive).mkdir(parents=True, exist_ok=True)
+        decisions = {}
+        with open(input.matrix) as h:
+            for r in csv.DictReader(h, delimiter="\t"): decisions[clean_mag_id(r["MAG"])] = parse_bool(r.get("production_eligible")) is True
+        copied_production, copied_archive = 0, 0
+        for fasta in sorted(Path(input.bins).glob("*.fa")):
+            target = output.production if decisions.get(clean_mag_id(fasta.name), False) else output.archive
+            shutil.copyfile(fasta, Path(target) / fasta.name)
+            if decisions.get(clean_mag_id(fasta.name), False): copied_production += 1
+            else: copied_archive += 1
+        Path(output.done).write_text(f"production={copied_production}\tarchive={copied_archive}\n")
+
+checkpoint drep:
+    input: production=PRODUCTION_MAGS, done=f"{FILTERED_DIR}/{SAMPLE}.filter.done", matrix=QUALITY_MATRIX
+    output: out_dir=directory(DREP_OUTPUT), done=DREP_DONE
+    log: f"{LOG_DIR}/dereplication/{SAMPLE}.drep.log"
+    threads: THREADS
+    run:
+        genomes = sorted(Path(input.production).glob("*.fa"))
+        shutil.rmtree(output.out_dir, ignore_errors=True); Path(output.out_dir).parent.mkdir(parents=True, exist_ok=True)
+        quality = {}
+        with open(input.matrix) as h:
+            for r in csv.DictReader(h, delimiter="\t"): quality[clean_mag_id(r["MAG"])] = (parse_float(r.get("checkm2_completeness")) or 0.0, parse_float(r.get("checkm2_contamination")) or 100.0)
+        
+        if len(genomes) <= 1:
+            rep_dir = Path(output.out_dir) / "dereplicated_genomes"
+            rep_dir.mkdir(parents=True, exist_ok=True)
+            if genomes: shutil.copyfile(genomes[0], rep_dir / genomes[0].name)
+        else:
+            info_csv = f"{DREP_DIR}/{SAMPLE}_genome_info.csv"
+            with open(info_csv, "w", newline="") as h:
+                w = csv.writer(h, lineterminator="\n"); w.writerow(["genome", "completeness", "contamination"])
+                for g in genomes: w.writerow([g.name, *quality.get(clean_mag_id(g.name), (0.0, 100.0))])
+            env = os.environ.copy()
+            env["PATH"] = DREP_ENV + os.pathsep + env.get("PATH", "")
+            command = [
+                DREP, "dereplicate", output.out_dir, "-g", *map(str, genomes), "--genomeInfo", info_csv,
+                "-pa", str(DREP_PRIMARY_ANI), "-sa", str(DREP_SECONDARY_ANI), "-nc", str(DREP_ALIGNED_FRACTION),
+                "--S_algorithm", DREP_ALGORITHM, "-comp", "0", "-con", "100", "-p", str(threads),
+            ]
+            with open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        Path(output.done).write_text("completed\n")
+
+rule gtdbtk:
+    input: drep_dir=DREP_OUTPUT, drep_done=DREP_DONE
+    output: out_dir=directory(GTDB_OUTPUT), done=GTDB_DONE
+    log: f"{LOG_DIR}/taxonomy/{SAMPLE}.gtdbtk.log"
+    threads: THREADS
+    run:
+        genomes = sorted((Path(input.drep_dir) / "dereplicated_genomes").glob("*.fa"))
+        shutil.rmtree(output.out_dir, ignore_errors=True); Path(output.out_dir).mkdir(parents=True, exist_ok=True)
+        if genomes:
+            Path(GTDB_SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env["PATH"] = GTDBTK_ENV + os.pathsep + env.get("PATH", "")
+            env["GTDBTK_DATA_PATH"] = GTDBTK_DATA_PATH
+            command = [
+                GTDBTK, "classify_wf", "--genome_dir", str(Path(input.drep_dir) / "dereplicated_genomes"),
+                "--out_dir", output.out_dir, "--extension", "fa", "--cpus", str(threads),
+                "--pplacer_cpus", str(GTDB_PPLACER_CPUS), "--scratch_dir", GTDB_SCRATCH_DIR,
+            ]
+            with open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        Path(output.done).write_text("completed\n")
+
+rule coverm_abundance:
+    input: drep_dir=DREP_OUTPUT, drep_done=DREP_DONE, r1=CLEAN_R1, r2=CLEAN_R2
+    output: tsv=f"{COVERM_DIR}/{SAMPLE}/abundance_matrix.tsv", done=f"{COVERM_DIR}/{SAMPLE}/coverm.done"
+    log: f"{LOG_DIR}/abundance/{SAMPLE}.coverm.log"
+    threads: THREADS
+    run:
+        genomes = sorted((Path(input.drep_dir) / "dereplicated_genomes").glob("*.fa"))
+        Path(output.tsv).parent.mkdir(parents=True, exist_ok=True)
+        if genomes:
+            env = os.environ.copy()
+            env["PATH"] = COVERM_ENV + os.pathsep + env.get("PATH", "")
+            command = [
+                COVERM, "genome", "--coupled", input.r1, input.r2, "--genome-fasta-files", *map(str, genomes),
+                "--mapper", COVERM_MAPPER, "--threads", str(threads), "--methods", "mean", "relative_abundance", "covered_fraction",
+                "--min-covered-fraction", str(COVERM_MIN_COVERED_FRACTION), "--min-read-percent-identity", str(COVERM_MIN_IDENTITY),
+                "--min-read-aligned-percent", str(COVERM_MIN_ALIGNED), "--output-file", output.tsv,
+            ]
+            with open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        else:
+            with open(output.tsv, "w") as handle: handle.write("Genome\tMean\tRelative Abundance (%)\tCovered Fraction\n")
+        Path(output.done).write_text("completed\n")
+
+rule prodigal_predict:
+    input: drep_dir=DREP_OUTPUT, drep_done=DREP_DONE
+    output:
+        faa=f"{ANNOTATION_DIR}/{SAMPLE}/representative_proteins.faa",
+        fna=f"{ANNOTATION_DIR}/{SAMPLE}/representative_genes.fna",
+        gff=f"{ANNOTATION_DIR}/{SAMPLE}/representative_genes.gff",
+        done=f"{ANNOTATION_DIR}/{SAMPLE}/prodigal.done"
+    log: f"{LOG_DIR}/annotation/{SAMPLE}.prodigal.log"
+    threads: 1
+    resources: mem_mb=8000, runtime=RUNTIME_MIN
+    run:
+        output_dir = Path(f"{ANNOTATION_DIR}/{SAMPLE}")
+        per_mag = output_dir / "per_mag"
+        shutil.rmtree(per_mag, ignore_errors=True); per_mag.mkdir(parents=True, exist_ok=True)
+        for path in (output.faa, output.fna):
+            Path(path).parent.mkdir(parents=True, exist_ok=True); Path(path).write_text("")
+        Path(output.gff).parent.mkdir(parents=True, exist_ok=True); Path(output.gff).write_text("##gff-version 3\n")
+        
+        genomes = sorted((Path(input.drep_dir) / "dereplicated_genomes").glob("*.fa"))
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True); Path(log[0]).write_text("")
+        
+        env = os.environ.copy()
+        env["PATH"] = str(Path(PRODIGAL).parent) + os.pathsep + env.get("PATH", "")
+        
+        for genome in genomes:
+            mag = clean_mag_id(genome.name)
+            prefixed, faa, fna, gff = per_mag/f"{mag}.prefixed.fa", per_mag/f"{mag}.faa", per_mag/f"{mag}.fna", per_mag/f"{mag}.gff"
+            prefix_fasta(genome, prefixed, mag)
+            total_length = fasta_metrics(genome)["total_length"]
+            
+            mode = PRODIGAL_MODE
+            if mode == "auto":
+                mode = "single" if total_length >= 100000 else "meta"
+            
+            command = [PRODIGAL, "-i", str(prefixed), "-a", str(faa), "-d", str(fna), "-o", str(gff), "-f", "gff", "-p", mode, "-q"]
+            with open(log[0], "ab") as log_handle:
+                subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+            
+            for src, dst in ((faa, output.faa), (fna, output.fna)):
+                with open(src, "rb") as s, open(dst, "ab") as d: shutil.copyfileobj(s, d)
+            with open(gff) as s, open(output.gff, "a") as d:
+                for line in s:
+                    if not line.startswith("##gff-version"): d.write(line)
+        Path(output.done).write_text("completed\n")
+
+rule prokka:
+    input: fasta=f"{DREP_OUTPUT}/dereplicated_genomes/{{mag}}.fa", drep_done=DREP_DONE, gtdb_dir=GTDB_OUTPUT, gtdb_done=GTDB_DONE
+    output: gff=f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff", faa=f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa"
+    log: f"{LOG_DIR}/annotation/{{sample}}_{{mag}}_prokka.log"
+    threads: MAG_THREADS
+    run:
+        outdir = Path(output.gff).parent; shutil.rmtree(outdir, ignore_errors=True); outdir.mkdir(parents=True, exist_ok=True)
+        kingdom = "Bacteria"
+        if PROKKA_KINGDOM == "auto":
+            for summary in Path(input.gtdb_dir).rglob("*summary.tsv"):
+                if "ar53" in summary.name: kingdom = "Archaea"
+        env = os.environ.copy()
+        env["PATH"] = PROKKA_ENV + os.pathsep + env.get("PATH", "")
+        command = [PROKKA, "--outdir", str(outdir), "--prefix", wildcards.mag, "--kingdom", kingdom, "--cpus", str(threads), "--force", "--compliant", "--metagenome", input.fasta]
+        with open(log[0], "wb") as log_handle:
+            subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+
+rule cctyper_per_mag:
+    input: fasta=f"{DREP_OUTPUT}/dereplicated_genomes/{{mag}}.fa", drep_done=DREP_DONE
+    output: done=f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done"
+    log: f"{LOG_DIR}/annotation/{{sample}}_{{mag}}_cctyper.log"
+    threads: MAG_THREADS
+    run:
+        outdir = Path(output.done).parent; shutil.rmtree(outdir, ignore_errors=True); outdir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = CCTYPER_ENV + os.pathsep + env.get("PATH", "")
+        command = [CCTYPER_BIN, input.fasta, str(outdir), "--db", CCTYPER_DB, "-t", str(threads)]
+        with open(log[0], "wb") as log_handle: subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=False)
+        Path(output.done).touch()
+
+rule dbcan_per_mag:
+    input: fasta=f"{DREP_OUTPUT}/dereplicated_genomes/{{mag}}.fa", drep_done=DREP_DONE
+    output: done=f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done"
+    log: f"{LOG_DIR}/annotation/{{sample}}_{{mag}}_dbcan.log"
+    threads: MAG_THREADS
+    run:
+        outdir = Path(output.done).parent; shutil.rmtree(outdir, ignore_errors=True); outdir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = DBCAN_ENV + os.pathsep + env.get("PATH", "")
+        command = [DBCAN_BIN, input.fasta, DBCAN_INPUT_TYPE, "--db_dir", DBCAN_DB, "--out_dir", str(outdir), "--tf_cpu", str(threads), "--dia_cpu", str(threads), "--hmm_cpu", str(threads)]
+        with open(log[0], "wb") as log_handle: subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        Path(output.done).touch()
+
+rule abricate:
+    input: fasta=f"{DREP_OUTPUT}/dereplicated_genomes/{{mag}}.fa", drep_done=DREP_DONE
+    output: tsv=f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv"
+    log: f"{LOG_DIR}/annotation/{{sample}}_{{db}}_{{mag}}_abricate.log"
+    threads: 1
+    run:
+        Path(output.tsv).parent.mkdir(parents=True, exist_ok=True); Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = ABRICATE_ENV + os.pathsep + env.get("PATH", "")
+        with open(output.tsv, "wb") as out_h, open(log[0], "wb") as log_h:
+            subprocess.run([ABRICATE, "--db", wildcards.db, "--minid", "80", "--mincov", "70", input.fasta], stdout=out_h, stderr=log_h, env=env, check=True)
+
+rule abricate_summary:
+    input: drep_done=DREP_DONE, tables=abricate_mag_inputs
+    output: summary=f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv"
+    log: f"{LOG_DIR}/annotation/{{sample}}_{{db}}_abricate_summary.log"
+    threads: 1
+    run:
+        Path(output.summary).parent.mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        tables = list(input.tables)
+        if not tables:
+            Path(output.summary).write_text("#FILE\tNUM_FOUND\n")
+            Path(log[0]).write_text("No dereplicated MAGs were available\n")
+        else:
+            env = os.environ.copy()
+            env["PATH"] = ABRICATE_ENV + os.pathsep + env.get("PATH", "")
+            command = [ABRICATE, "--summary", *map(str, tables)]
+            with open(output.summary, "wb") as out_handle, open(log[0], "wb") as log_handle:
+                subprocess.run(command, stdout=out_handle, stderr=log_handle, env=env, check=True)
+
+rule hadeg_proteinortho:
+    input: hadeg_db=lambda wc: HADEG_DB, prokka_done=f"{PROKKA_DIR}/{{sample}}/prokka.done", mags=hadeg_mag_inputs
+    output: tsv=f"{HADEG_OUTDIR}/{{sample}}/Results_HADEG.proteinortho.tsv", done=f"{HADEG_OUTDIR}/{{sample}}/hadeg_proteinortho.done"
+    log: f"{LOG_DIR}/annotation/{{sample}}_hadeg.log"
+    threads: THREADS
+    run:
+        outdir = Path(output.tsv).parent.resolve(); clean_dir = outdir / "clean_faa"
+        shutil.rmtree(clean_dir, ignore_errors=True); clean_dir.mkdir(parents=True, exist_ok=True)
+        hadeg_db = Path(input.hadeg_db).resolve()
+        
+        def sanitize_fasta(src, dst):
+            allowed = re.compile(r"[^XOUBZACDEFGHIKLMNPQRSTVWY]", re.IGNORECASE)
+            with open(src) as s, open(dst, "w") as d:
+                for line in s:
+                    if line.startswith(">"): d.write(line)
+                    elif (seq := allowed.sub("", line.strip())): d.write(seq + "\n")
+        
+        sanitize_fasta(hadeg_db, clean_dir / hadeg_db.name)
+        clean_mags = []
+        for src in input.mags:
+            tgt = clean_dir / Path(src).name
+            sanitize_fasta(src, tgt); clean_mags.append(str(tgt.resolve()))
+            
+        if not clean_mags:
+            Path(output.tsv).write_text(f"# Species\tGenes\tAlg.-Conn.\t{hadeg_db.name}\n")
+        else:
+            env = os.environ.copy()
+            env["PATH"] = str(Path(PROTEINORTHO).parent) + os.pathsep + env.get("PATH", "")
+            with open(log[0], "wb") as log_handle:
+                subprocess.run([PROTEINORTHO, str((clean_dir / hadeg_db.name).resolve()), *clean_mags, "-identity=50", "-conn=0.3", "-synteny=0", "-project=Results_HADEG", f"-binpath={HADEG_BLAST_BINPATH}", f"-cpus={threads}"], cwd=outdir, stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=True)
+        Path(output.done).touch()
+
+# Collect "all" rules
+rule prokka_all:
+    input: drep_done=DREP_DONE, annotations=prokka_all_inputs
+    output: done=f"{PROKKA_DIR}/{{sample}}/prokka.done"
+    run: Path(output.done).parent.mkdir(parents=True, exist_ok=True); Path(output.done).touch()
+
+rule cctyper_all:
+    input: drep_done=DREP_DONE, annotations=cctyper_all_inputs
+    output: done=f"{CCTYPER_DIR}/{{sample}}/cctyper.done"
+    run: Path(output.done).parent.mkdir(parents=True, exist_ok=True); Path(output.done).touch()
+
+rule dbcan_all:
+    input: drep_done=DREP_DONE, annotations=dbcan_all_inputs
+    output: done=f"{DBCAN_DIR}/{{sample}}/dbcan.done"
+    run: Path(output.done).parent.mkdir(parents=True, exist_ok=True); Path(output.done).touch()
+
+rule abricate_all:
+    input: summaries=lambda wildcards: expand(f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv", sample=wildcards.sample, db=ABRICATE_DBS)
+    output: done=f"{ABRICATE_DIR}/{{sample}}/abricate.done"
+    run: Path(output.done).parent.mkdir(parents=True, exist_ok=True); Path(output.done).touch()
+
+rule multiqc:
+    input: MULTIQC_INPUTS
+    output: report=f"{MULTIQC_DIR}/multiqc_report.html"
+    log: f"{LOG_DIR}/reporting/{SAMPLE}_multiqc.log"
+    threads: 1
+    run:
+        Path(MULTIQC_DIR).mkdir(parents=True, exist_ok=True); Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        scan_paths = [FASTP_DIR, RAW_QC_DIR, CLEAN_QC_DIR, ASSEMBLY_QC_DIR, MAP_DIR, MAG_QC_DIR]
+        if RUN_KRAKEN: scan_paths.append(KRAKEN_DIR)
+        if RUN_PROKKA: scan_paths.append(PROKKA_DIR)
+        if RUN_CCTYPER: scan_paths.append(CCTYPER_DIR)
+        if RUN_DBCAN: scan_paths.append(DBCAN_DIR)
+        if RUN_DRAM: scan_paths.append(DRAM_DIR)
+        if RUN_ABRICATE: scan_paths.append(ABRICATE_DIR)
+        if RUN_HADEG: scan_paths.append(HADEG_OUTDIR)
+        
+        env = os.environ.copy()
+        env["PATH"] = str(Path(MULTIQC).parent) + os.pathsep + env.get("PATH", "")
+        with open(log[0], "wb") as log_handle:
+            subprocess.run([MULTIQC, *scan_paths, "--ignore", "*.done", "--ignore", "*.bam", "--ignore", "*.bai", "--ignore", "*/per_mag/*", "-o", MULTIQC_DIR, "--force"], stdout=log_handle, stderr=subprocess.STDOUT, env=env, check=False)
+
+rule kraken2:
+    input:
+        r1 = CLEAN_R1,
+        r2 = CLEAN_R2
+    output:
+        report = f"{KRAKEN_DIR}/{SAMPLE}_kraken2_report.tsv",
+        out    = f"{KRAKEN_DIR}/{SAMPLE}_kraken2.out"
+    log: f"{LOG_DIR}/kraken2/{SAMPLE}.log"
+    threads: THREADS
+    run:
+        Path(output.report).parent.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = str(Path(KRAKEN2).parent) + os.pathsep + env.get("PATH", "")
+        command = [
+            KRAKEN2,
+            "--db", KRAKEN2_DB,
+            "--threads", str(threads),
+            "--paired", input.r1, input.r2,
+            "--report", output.report,
+            "--output", output.out
+        ]
+        if KRAKEN_CONFIDENCE > 0.0:
+            command.extend(["--confidence", str(KRAKEN_CONFIDENCE)])
+        if KRAKEN_MIN_HIT_GROUPS > 2:
+            command.extend(["--minimum-hit-groups", str(KRAKEN_MIN_HIT_GROUPS)])
+        if KRAKEN_MEMORY_MAPPING:
+            command.append("--memory-mapping")
+        run_command(command, log[0], env=env)
+
+rule bracken:
+    input:
+        report = f"{KRAKEN_DIR}/{SAMPLE}_kraken2_report.tsv"
+    output:
+        species = f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv"
+    log: f"{LOG_DIR}/bracken/{SAMPLE}.log"
+    run:
+        env = os.environ.copy()
+        env["PATH"] = str(Path(BRACKEN).parent) + os.pathsep + env.get("PATH", "")
+        command = [
+            BRACKEN,
+            "-d", KRAKEN2_DB,
+            "-i", input.report,
+            "-o", output.species,
+            "-l", BRACKEN_LEVEL,
+            "-t", str(BRACKEN_THRESHOLD),
+            "-r", str(BRACKEN_READ_LENGTH)
+        ]
+        run_command(command, log[0], env=env)
+
+rule virsorter2:
+    input:
+        contigs = CONTIGS
+    output:
+        done = f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done"
+    log:
+        f"{LOG_DIR}/viral/{SAMPLE}.virsorter2.log"
+    threads: THREADS
+    run:
+        workdir = f"{VIRAL_DIR}/{SAMPLE}/virsorter2"
+        shutil.rmtree(workdir, ignore_errors=True)
+        Path(workdir).parent.mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PATH"] = str(Path(VIRSORTER2).parent) + os.pathsep + env.get("PATH", "")
+        command = [
+            VIRSORTER2, "run",
+            "-i", input.contigs,
+            "-w", workdir,
+            "-j", str(threads),
+            "--min-length", str(VIRSORTER_MIN_LENGTH),
+            "--min-score", str(VIRSORTER_MIN_SCORE),
+            "all"
+        ]
+        run_command(command, log[0], env=env)
+        Path(output.done).touch()
+
+rule dram_per_mag:
+    input:
+        fasta=f"{DREP_OUTPUT}/dereplicated_genomes/{{mag}}.fa",
+        drep_done=DREP_DONE
+    output:
+        done=f"{DRAM_DIR}/{{sample}}/{{mag}}/dram.done"
+    log:
+        f"{LOG_DIR}/annotation/{{sample}}_{{mag}}_dram.log"
+    threads: MAG_THREADS
+    run:
+        outdir = Path(DRAM_DIR) / wildcards.sample / wildcards.mag
+        shutil.rmtree(outdir, ignore_errors=True)
+        outdir.parent.mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        if DRAM_ENV:
+            env["PATH"] = DRAM_ENV + os.pathsep + env.get("PATH", "")
+
+        annotate_command = [
+            DRAM_BIN,
+            "annotate",
+            "-i", input.fasta,
+            "-o", str(outdir),
+            "--threads", str(threads),
+            "--min_contig_size", "1000",
+        ]
+        with open(log[0], "wb") as log_handle:
+            subprocess.run(
+                annotate_command,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=True,
+            )
+
+            annotations = outdir / "annotations.tsv"
+            if not annotations.is_file() or annotations.stat().st_size == 0:
+                raise FileNotFoundError(f"DRAM annotate did not create {annotations}")
+
+            distill_command = [
+                DRAM_BIN,
+                "distill",
+                "-i", str(annotations),
+                "-o", str(outdir / "distillate"),
+            ]
+            trna_path = outdir / "trnas.tsv"
+            rrna_path = outdir / "rrnas.tsv"
+            if trna_path.is_file():
+                distill_command.extend(["--trna_path", str(trna_path)])
+            if rrna_path.is_file():
+                distill_command.extend(["--rrna_path", str(rrna_path)])
+
+            subprocess.run(
+                distill_command,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=True,
+            )
+
+        Path(output.done).touch()
+
+rule dram_all:
+    input:
+        drep_done=DREP_DONE,
+        annotations=dram_all_inputs
+    output:
+        done=f"{DRAM_DIR}/{{sample}}/dram.done"
+    run:
+        Path(output.done).parent.mkdir(parents=True, exist_ok=True)
+        Path(output.done).write_text(f"annotated_mags={len(input.annotations)}\n")

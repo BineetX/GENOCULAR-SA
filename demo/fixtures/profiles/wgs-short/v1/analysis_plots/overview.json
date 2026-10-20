@@ -1,0 +1,7 @@
+{
+  "sample_id": "DEMO_ECOLI_SHORT",
+  "demo": true,
+  "checkm": {"completeness": 98.4, "contamination": 0.7},
+  "busco": {"complete": 98.0, "fragmented": 1.0, "missing": 1.0},
+  "summary": {"assembly_type": "short-read", "illustrative": true}
+}

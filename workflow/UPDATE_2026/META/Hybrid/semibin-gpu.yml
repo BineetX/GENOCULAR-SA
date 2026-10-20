@@ -1,0 +1,11 @@
+name: semibin_gpu
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Isolated from the general binning environment so CUDA PyTorch cannot
+  # disturb MetaBAT2, DAS Tool, or their R dependencies.
+  - python=3.14
+  - semibin=2.2.1
+  - pytorch-gpu=2.10
+  - cuda-version=12.9

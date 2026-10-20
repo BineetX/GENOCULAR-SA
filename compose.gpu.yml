@@ -1,0 +1,13 @@
+services:
+  ollama:
+    gpus: all
+    environment:
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+
+  runner:
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      SEMIBIN_ENGINE: gpu

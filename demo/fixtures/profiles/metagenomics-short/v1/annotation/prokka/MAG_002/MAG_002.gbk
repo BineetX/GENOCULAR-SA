@@ -1,0 +1,21 @@
+LOCUS       DEMO0002                120 bp    DNA     linear   BCT 18-AUG-2026
+DEFINITION  Synthetic demonstration MAG; not for scientific interpretation.
+ACCESSION   DEMO0002
+VERSION     DEMO0002.1
+KEYWORDS    .
+SOURCE      uncultured bacterium
+  ORGANISM  uncultured bacterium
+FEATURES             Location/Qualifiers
+     source          1..120
+                     /organism="uncultured bacterium"
+                     /mol_type="genomic DNA"
+     CDS             10..99
+                     /locus_tag="MAG2_0001"
+                     /gene="rpoB"
+                     /product="DNA-directed RNA polymerase subunit beta"
+                     /translation="MKKIGYSAPRQT"
+ORIGIN
+        1 ttgcgtaacg ttaacggcta cgtacgtacg tacgtacgta cgtacgtacg tacgtacgta
+       61 cgtacgtacg tacgtacgta cgtacgtacg tacgtacgta cgtacgtacg tacgtacgtt
+//
+

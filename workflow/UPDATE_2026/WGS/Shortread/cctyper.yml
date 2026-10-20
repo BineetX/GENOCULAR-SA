@@ -1,0 +1,10 @@
+name: wgs_shortread_cctyper
+channels:
+  - russel88
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - setuptools<81
+  - cctyper

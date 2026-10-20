@@ -1,6 +1,3 @@
-<<<<<<< Updated upstream
-# GENOCULAR-SA
-=======
 # GENOCULAR
 
 GENOCULAR is a self-hosted web platform for microbial whole-genome sequencing
@@ -794,4 +791,5 @@ tools, reference databases, and MinIO Community's AGPL terms.
 
 The portable package uses pinned MinIO Community source builds and does not
 contain licensed AIStor material.
->>>>>>> Stashed changes
+
+ 

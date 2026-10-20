@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "job_id": "demo-fixture",
+  "sample": "DEMO_ECOLI_HYBRID",
+  "analysis_type": "wgs",
+  "mode": "hybrid",
+  "generated_at": "2026-08-18T00:00:00Z",
+  "sections": [{"id": "metaquast_curve", "title": "Hybrid assembly contiguity", "type": "plotly", "path": "analysis_plots/overview.json", "source": "demo", "order": 100, "renderer": "metaquast_curve"}],
+  "generator_runs": []
+}

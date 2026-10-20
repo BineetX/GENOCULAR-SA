@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "metagenomics:hybrid",
+  "sample": "DEMO_COMMUNITY_HYBRID",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example hybrid community workflow with complementary read QC, hybrid assembly, binning, MAG quality, abundance, and annotation outputs."
+}

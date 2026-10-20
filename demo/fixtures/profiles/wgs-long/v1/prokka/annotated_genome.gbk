@@ -1,0 +1,21 @@
+LOCUS       DEMO0001                120 bp    DNA     circular BCT 18-AUG-2026
+DEFINITION  Synthetic demonstration genome; not for scientific interpretation.
+ACCESSION   DEMO0001
+VERSION     DEMO0001.1
+KEYWORDS    .
+SOURCE      synthetic construct
+  ORGANISM  synthetic construct
+FEATURES             Location/Qualifiers
+     source          1..120
+                     /organism="synthetic construct"
+                     /mol_type="genomic DNA"
+     CDS             1..90
+                     /locus_tag="DEMO_0001"
+                     /gene="dnaA"
+                     /product="chromosomal replication initiator protein DnaA"
+                     /translation="MNNIRRVAIACGKTN"
+ORIGIN
+        1 atgcgtaacg ttaacggcta cgtacgtacg tacgtacgta cgtacgtacg tacgtacgta
+       61 cgtacgtacg tacgtacgta cgtacgtacg tacgtacgta cgtacgtacg tacgtacgta
+//
+

@@ -1,0 +1,10 @@
+{
+  "sample_id": "DEMO_ECOLI_HYBRID",
+  "demo": true,
+  "stats": {"# contigs": 2, "N50": 4620000, "Total length": 4870000, "GC": 50.8},
+  "curve": [
+    {"rank": 1, "length_bp": 4620000, "cumsum_mbp": 4.62, "zone": "Core (rank 1 to L50)"},
+    {"rank": 2, "length_bp": 250000, "cumsum_mbp": 4.87, "zone": "Tail (L90 to end)"}
+  ],
+  "summary": {"assembly_type": "hybrid", "illustrative": true}
+}
