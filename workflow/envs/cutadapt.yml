@@ -1,0 +1,41 @@
+name: cutadapt
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - _libgcc_mutex=0.1
+  - _openmp_mutex=4.5
+  - bz2file=0.98
+  - ca-certificates=2024.12.14
+  - cutadapt=2.6
+  - dnaio=0.3
+  - ld_impl_linux-64=2.43
+  - libffi=3.4.2
+  - libgcc=14.2.0
+  - libgcc-ng=14.2.0
+  - libgomp=14.2.0
+  - liblzma=5.6.3
+  - liblzma-devel=5.6.3
+  - libnsl=2.0.1
+  - libsqlite=3.47.2
+  - libstdcxx=14.2.0
+  - libstdcxx-ng=14.2.0
+  - libzlib=1.3.1
+  - ncurses=6.5
+  - openssl=3.4.0
+  - pigz=2.8
+  - pip=24.0
+  - python=3.7.12
+  - readline=8.2
+  - setuptools=69.0.3
+  - sqlite=3.47.2
+  - tk=8.6.13
+  - wheel=0.42.0
+  - xopen=0.7.3
+  - xz=5.6.3
+  - xz-gpl-tools=5.6.3
+  - unzip
+  - xz-tools=5.6.3

@@ -1,0 +1,2368 @@
+#!/usr/bin/env python
+
+from snakemake.io import glob_wildcards
+import os
+import glob
+import json
+import re as _re
+from pathlib import Path
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+############################################
+# HADEG SETTINGS
+############################################
+BASE_PATH = config.get("BASE", os.environ.get("BASE_PATH", "/data/genoverse"))
+OUTPUT_ROOT = f"{BASE_PATH}/hybrid_results"
+
+HADEG_DB     = os.environ.get("HADEG_DB", "/dbs/hadeg/HADEG_protein_database_231119.faa")
+HADEG_OUTDIR = f"{OUTPUT_ROOT}/hadeg"
+HADEG_RUNNER = os.environ.get(
+    "HADEG_RUNNER",
+    "/project/workflow/UPDATE_2026/META/run_hadeg_proteinortho.py",
+)
+HADEG_STALL_SECONDS = int(os.environ.get("HADEG_STALL_SECONDS", "900"))
+HADEG_MAX_ATTEMPTS = int(os.environ.get("HADEG_MAX_ATTEMPTS", "3"))
+
+############################################
+# CONFIG
+############################################
+SAMPLE    = config["sample"]
+THREADS   = config.get("threads", 64)
+READ_TYPE = config.get("read_type", "ont")   # "ont" | "pacbio-raw" | "pacbio-hifi"
+HOST_REF  = config.get("host_ref") or os.environ.get("HOST_REF", "")
+HOST_DB   = config.get("host_db") or os.environ.get("KNEADDATA_DB_PREFIX", "/dbs/kneaddata_db/hg_39")
+config.setdefault("reads", {})
+config["reads"].setdefault("short_r1", config.get("R1"))
+config["reads"].setdefault("short_r2", config.get("R2"))
+config["reads"].setdefault("long", config.get("R0") or config.get("R1"))
+
+# Per-MAG thread cap: keeps multiple MAG jobs running simultaneously
+MAG_THREADS = min(8, THREADS // 4)
+
+FASTP_CONFIG = config.get("fastp", {})
+FASTP_QUALIFIED_Q = int(FASTP_CONFIG.get("qualified_quality_phred", 20))
+FASTP_MIN_LENGTH = int(FASTP_CONFIG.get("minimum_length", 50))
+FASTP_LOW_COMPLEXITY = as_bool(FASTP_CONFIG.get("low_complexity_filter", True))
+FASTP_CUT_FRONT = as_bool(FASTP_CONFIG.get("cut_front", True))
+FASTP_CUT_TAIL = as_bool(FASTP_CONFIG.get("cut_tail", True))
+FASTP_LOW_COMPLEXITY_FLAG = "--low_complexity_filter" if FASTP_LOW_COMPLEXITY else ""
+FASTP_CUT_FRONT_FLAG = "--cut_front" if FASTP_CUT_FRONT else ""
+FASTP_CUT_TAIL_FLAG = "--cut_tail" if FASTP_CUT_TAIL else ""
+
+MEGAHIT_CONFIG = config.get("megahit", {})
+MEGAHIT_MIN_CONTIG_LEN = int(MEGAHIT_CONFIG.get("min_contig_len", 500))
+
+KRAKEN_CONFIG = config.get("kraken2", {})
+RUN_KRAKEN = as_bool(KRAKEN_CONFIG.get("enabled", False))
+KRAKEN_CONFIDENCE = float(KRAKEN_CONFIG.get("confidence", 0.0))
+KRAKEN_MIN_HIT_GROUPS = int(KRAKEN_CONFIG.get("minimum_hit_groups", 2))
+KRAKEN_CONFIDENCE_FLAG = f"--confidence {KRAKEN_CONFIDENCE}" if KRAKEN_CONFIDENCE > 0 else ""
+KRAKEN_MIN_HIT_GROUPS_FLAG = (
+    f"--minimum-hit-groups {KRAKEN_MIN_HIT_GROUPS}"
+    if KRAKEN_MIN_HIT_GROUPS > 0 else ""
+)
+
+BRACKEN_CONFIG = config.get("bracken", {})
+BRACKEN_LEVEL = str(BRACKEN_CONFIG.get("level", "S"))
+BRACKEN_THRESHOLD = int(BRACKEN_CONFIG.get("threshold", 10))
+BRACKEN_READ_LENGTH = int(BRACKEN_CONFIG.get("read_length", 150))
+
+VIRAL_CONFIG = config.get("viral", {})
+RUN_VIRSORTER2 = as_bool(VIRAL_CONFIG.get("enabled", True))
+VIRSORTER_MIN_LENGTH = int(VIRAL_CONFIG.get("virsorter2_min_length", 1500))
+VIRSORTER_MIN_SCORE = float(VIRAL_CONFIG.get("virsorter2_min_score", 0.5))
+
+SEMIBIN_CONFIG = config.get("semibin", {})
+SEMIBIN_MIN_LEN = int(SEMIBIN_CONFIG.get("min_len", 1500))
+SEMIBIN_ENVIRONMENT = str(SEMIBIN_CONFIG.get("environment", "global"))
+SEMIBIN_ENGINE = str(SEMIBIN_CONFIG.get(
+    "engine",
+    os.environ.get("SEMIBIN_ENGINE", "gpu"),
+)).strip().lower()
+if SEMIBIN_ENGINE not in {"gpu", "auto", "cpu"}:
+    raise ValueError("semibin.engine must be one of: gpu, auto, cpu")
+
+QUALITY_CONFIG = config.get("quality_thresholds", {})
+MIN_COMPLETENESS = float(QUALITY_CONFIG.get("minimum_completeness", 50.0))
+MAX_CONTAMINATION = float(QUALITY_CONFIG.get("maximum_contamination", 10.0))
+HIGH_COMPLETENESS = float(QUALITY_CONFIG.get("high_completeness", 90.0))
+HIGH_CONTAMINATION = float(QUALITY_CONFIG.get("high_contamination", 5.0))
+MEDIUM_COMPLETENESS = float(QUALITY_CONFIG.get("medium_completeness", MIN_COMPLETENESS))
+MEDIUM_CONTAMINATION = float(QUALITY_CONFIG.get("medium_contamination", MAX_CONTAMINATION))
+
+DREP_CONFIG = config.get("drep_options", {})
+DREP_PRIMARY_ANI = float(DREP_CONFIG.get("primary_ani", 0.90))
+DREP_SECONDARY_ANI = float(DREP_CONFIG.get("secondary_ani", 0.95))
+DREP_ALIGNED_FRACTION = float(DREP_CONFIG.get("minimum_aligned_fraction", 0.30))
+DREP_MIN_COMPLETENESS = float(DREP_CONFIG.get("minimum_completeness", MIN_COMPLETENESS))
+DREP_MAX_CONTAMINATION = float(DREP_CONFIG.get("maximum_contamination", MAX_CONTAMINATION))
+
+ANNOTATION_MODULES = config.get("annotation_modules", {})
+RUN_PROKKA = as_bool(ANNOTATION_MODULES.get("prokka", True))
+RUN_CCTYPER = as_bool(ANNOTATION_MODULES.get("cctyper", True))
+RUN_DBCAN = as_bool(ANNOTATION_MODULES.get("dbcan", True))
+RUN_ABRICATE = as_bool(ANNOTATION_MODULES.get("abricate", True))
+RUN_HADEG = as_bool(ANNOTATION_MODULES.get("hadeg", True))
+RUN_BUSCO_FILTERED = as_bool(ANNOTATION_MODULES.get("busco_filtered", True))
+RUN_PROKKA_CHAIN = RUN_PROKKA or RUN_HADEG
+
+# Minimap2 preset
+MM2_PRESET = {
+    "ont":         "map-ont",
+    "pacbio-raw":  "map-pb",
+    "pacbio-hifi": "map-hifi",
+}.get(READ_TYPE, "map-ont")
+
+# Wildcard constraint prevents _sr/_lr suffixes being absorbed into {sample}
+wildcard_constraints:
+    sample = _re.escape(SAMPLE)
+
+############################################
+# OUTPUT DIRECTORIES
+############################################
+FASTP_DIR          = f"{OUTPUT_ROOT}/fastp"
+NANOSTAT_DIR       = f"{OUTPUT_ROOT}/nanostat"
+NANOQ_DIR          = f"{OUTPUT_ROOT}/nanoq"
+SR_HOST_DIR        = f"{OUTPUT_ROOT}/host_removal_sr"
+LR_HOST_DIR        = f"{OUTPUT_ROOT}/host_removal_lr"
+MEGAHIT_DIR        = f"{OUTPUT_ROOT}/megahit"
+OPRAMS_DIR         = f"{OUTPUT_ROOT}/operams"
+MAP_DIR            = f"{OUTPUT_ROOT}/mapping"
+BIN_DIR            = f"{OUTPUT_ROOT}/binning"
+DAS_DIR            = f"{OUTPUT_ROOT}/dastool"
+CHECKM_DIR          = f"{OUTPUT_ROOT}/checkm2"
+BUSCO_DIR           = f"{OUTPUT_ROOT}/busco"
+BUSCO_FILTERED_DIR = f"{OUTPUT_ROOT}/busco_filtered"
+MAGQC_DIR           = f"{OUTPUT_ROOT}/mag_quast"
+MERGED_QC           = f"{OUTPUT_ROOT}/mag_qc_merged"
+FILTERED_DIR        = f"{OUTPUT_ROOT}/mag_filtered"
+REJECTED_DIR        = f"{OUTPUT_ROOT}/mag_rejected"
+GTDB_DIR            = f"{OUTPUT_ROOT}/gtdbtk"
+DREP_DIR            = f"{OUTPUT_ROOT}/drep"
+BARRNAP_DIR         = f"{OUTPUT_ROOT}/barrnap"
+PROKKA_DIR          = f"{OUTPUT_ROOT}/annotation/prokka"
+CCTYPER_DIR         = f"{OUTPUT_ROOT}/annotation/cctyper"
+DBCAN_DIR           = f"{OUTPUT_ROOT}/annotation/dbcan"
+ABRICATE_DIR        = f"{OUTPUT_ROOT}/annotation/abricate"
+KRAKEN_DIR          = f"{OUTPUT_ROOT}/kraken"
+VIRAL_DIR           = f"{OUTPUT_ROOT}/viral"
+PRODIGAL_DIR        = f"{OUTPUT_ROOT}/prodigal"
+CDHIT_DIR           = f"{OUTPUT_ROOT}/cdhit"
+COVERM_DIR           = f"{OUTPUT_ROOT}/coverm"
+QUANT_DIR           = f"{OUTPUT_ROOT}/quant_hybrid"
+MULTIQC_DIR         = f"{OUTPUT_ROOT}/multiqc"
+QUAST_DIR           = f"{OUTPUT_ROOT}/quast"
+
+############################################
+# SERVER TOOL AND DATABASE PATHS
+############################################
+def _find_env(env_var, env_names, probe):
+    candidates = [os.environ.get(env_var, "")]
+    candidates.extend(f"/opt/conda/envs/{name}" for name in env_names)
+    shared = Path(os.environ.get(
+        "SHARED_CONDA_PREFIX",
+        "/data/genoverse/smk_envs_profiles/metagenomics/hybrid/tool_envs",
+    ))
+    candidates.extend(str(shared / name) for name in env_names)
+    if shared.exists():
+        candidates.extend(str(path) for path in sorted(shared.iterdir()) if path.is_dir())
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "bin" / probe).exists():
+            return Path(candidate)
+    return None
+
+def _tool(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin" / binary) if env_dir else binary
+
+def _binpath(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin") if env_dir else ""
+
+FASTP         = _tool("GENOVERSE_ENV_MARINE", ["marine"], "fastp")
+KNEADDATA     = _tool("GENOVERSE_ENV_KNEADDATA", ["kneaddata_env", "kneaddata"], "kneaddata")
+NANOSTAT      = _tool("GENOVERSE_ENV_NANOPLOT", ["nanoplot"], "NanoStat")
+NANOQ         = _tool("GENOVERSE_ENV_NANOPLOT", ["nanoplot"], "nanoq")
+MEGAHIT       = _tool("GENOVERSE_ENV_MEGAHIT", ["megahit_env", "megahit"], "megahit")
+OPERAMS_PL    = os.environ.get("OPERAMS_BIN", "/dbs/OPERA-MS/OPERA-MS.pl")
+OPERAMS_PERL  = _tool("GENOVERSE_ENV_OPERAMS", ["operams"], "perl")
+OPERAMS_SAMTOOLS = _tool("GENOVERSE_ENV_OPERAMS", ["operams"], "samtools")
+SEQKIT        = _tool("GENOVERSE_ENV_SEQKIT", ["seqkit_env", "seqkit"], "seqkit")
+MINIMAP2      = _tool("GENOVERSE_ENV_MEDAKA", ["medaka_env", "medaka"], "minimap2")
+BOWTIE2       = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2")
+BOWTIE2_BUILD = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2-build")
+SAMTOOLS      = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "samtools")
+METABAT2      = _tool("GENOVERSE_ENV_BINNING", ["binning"], "metabat2")
+DASTOOL       = _tool("GENOVERSE_ENV_BINNING", ["binning"], "DAS_Tool")
+JGI           = _tool("GENOVERSE_ENV_BINNING", ["binning"], "jgi_summarize_bam_contig_depths")
+SEMIBIN2      = _tool("GENOVERSE_ENV_SEMIBIN", ["semibin_gpu", "binning"], "SemiBin2")
+SEMIBIN_ENV   = _binpath("GENOVERSE_ENV_SEMIBIN", ["semibin_gpu", "binning"], "SemiBin2")
+CDHIT_AA      = _tool("GENOVERSE_ENV_CDHIT", ["cdhit-env", "cdhit"], "cd-hit")
+FEATURECOUNTS = _tool("GENOVERSE_ENV_CDHIT", ["cdhit-env", "cdhit"], "featureCounts")
+CHECKM2_PY    = _tool("GENOVERSE_ENV_CHECKM2", ["checkm2_env", "checkm2"], "python")
+CHECKM2       = _tool("GENOVERSE_ENV_CHECKM2", ["checkm2_env", "checkm2"], "checkm2")
+BUSCO_BIN     = _tool("GENOVERSE_ENV_BUSCO", ["busco"], "busco")
+GTDBTK        = _tool("GENOVERSE_ENV_GTDBTK", ["gtdbk_env", "gtdbtk"], "gtdbtk")
+DREP_BIN      = _tool("GENOVERSE_ENV_DREP", ["drep_env", "drep"], "dRep")
+BARRNAP_BIN   = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "barrnap")
+PROKKA        = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "prokka")
+CCTYPER_BIN   = _tool("GENOVERSE_ENV_CCTYPER", ["cctyper"], "cctyper")
+DBCAN_BIN     = _tool("GENOVERSE_ENV_DBCAN", ["dbcan"], "run_dbcan")
+ABRICATE      = _tool("GENOVERSE_ENV_ABRICATE", ["abricate-env", "abricate"], "abricate")
+KRAKEN2       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2"], "kraken2")
+BRACKEN       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2"], "bracken")
+VIRSORTER2    = _tool("GENOVERSE_ENV_VIRSORTER", ["virsorter"], "virsorter")
+PRODIGAL      = _tool("GENOVERSE_ENV_PRODIGAL", ["prodigal_env", "binning"], "prodigal")
+COVERM        = _tool("GENOVERSE_ENV_COVERM", ["coverm-env", "coverm"], "coverm")
+MULTIQC       = _tool("GENOVERSE_ENV_MULTIQC", ["multiqc_env", "multiqc"], "multiqc")
+QUAST         = _tool("GENOVERSE_ENV_QUAST", ["quast"], "metaquast.py")
+QUAST_BIN     = _tool("GENOVERSE_ENV_QUAST", ["quast"], "quast.py")
+PROTEINORTHO  = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "proteinortho")
+HADEG_DIAMOND = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "diamond")
+HADEG_PYTHON  = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "python")
+
+OPERAMS_DB    = os.environ.get("OPERAMS_DB", "/dbs/OPERA-MS/OPERA-MS-DB")
+CHECKM2_DB    = os.environ.get("CHECKM2_DB", "/dbs/checkm2/CheckM2_database/uniref100.KO.1.dmnd")
+GTDBTK_DB     = os.environ.get("GTDBTK_DATA_PATH", "/dbs/gtdbtk")
+BUSCO_LINEAGE = os.environ.get("BUSCO_LINEAGE", "/dbs/busco_bacteria_odb12")
+CCTYPER_DB    = os.environ.get("CCTYPER_DB", "/dbs/cctyper")
+DBCAN_DB      = os.environ.get("DBCAN_DB_DIR", "/dbs/dbcan_db/db")
+
+def _resolve_kraken2_db(path):
+    if os.path.exists(os.path.join(path, "taxo.k2d")):
+        return path
+    matches = sorted(glob.glob(os.path.join(path, "*", "taxo.k2d")))
+    if matches:
+        return os.path.dirname(matches[0])
+    return path
+
+KRAKEN2_DB    = _resolve_kraken2_db(os.environ.get("KRAKEN2_DB", "/dbs/kraken2_db"))
+VIRSORTER2_DB = os.environ.get("VIRSORTER2_DB", "/dbs/virsorter2_db")
+
+KNEADDATA_ENV = str(Path(KNEADDATA).parent)
+MARINE_ENV    = str(Path(FASTP).parent)
+OPERAMS_ENV   = str(Path(OPERAMS_PERL).parent)
+_OPERAMS_RUNTIME_PL = Path(OPERAMS_ENV).parent / "share" / "opera-ms" / "OPERA-MS.pl"
+if "OPERAMS_BIN" not in os.environ and _OPERAMS_RUNTIME_PL.exists():
+    OPERAMS_PL = str(_OPERAMS_RUNTIME_PL)
+BINNING_ENV   = str(Path(METABAT2).parent)
+PROKKA_ENV    = str(Path(PROKKA).parent)
+GTDBTK_ENV    = str(Path(GTDBTK).parent)
+DREP_ENV      = str(Path(DREP_BIN).parent)
+COVERM_ENV    = str(Path(COVERM).parent)
+CCTYPER_ENV   = str(Path(CCTYPER_BIN).parent)
+DBCAN_ENV     = str(Path(DBCAN_BIN).parent)
+ABRICATE_ENV  = str(Path(ABRICATE).parent)
+KRAKEN_ENV    = str(Path(KRAKEN2).parent)
+VIRSORTER2_ENV= str(Path(VIRSORTER2).parent)
+CDHIT_ENV     = str(Path(CDHIT_AA).parent)
+BARRNAP_ENV   = str(Path(BARRNAP_BIN).parent)
+CHECKM2_ENV   = str(Path(CHECKM2).parent)
+BUSCO_ENV     = str(Path(BUSCO_BIN).parent)
+QUAST_ENV     = str(Path(QUAST_BIN).parent)
+
+############################################
+# ABRicate databases
+############################################
+ABRICATE_DBS = [str(db) for db in config.get(
+    "abricate_dbs",
+    ["ncbi", "argannot", "resfinder", "ecoli_vf", "vfdb", "ecoh", "plasmidfinder", "card"],
+)]
+
+############################################
+# Hybrid assembly output (OPERA-MS scaffolds)
+############################################
+def assembly_fasta(wildcards):
+    return f"{OPRAMS_DIR}/{wildcards.sample}_nostrain/contigs.fasta"
+
+############################################
+# HELPER: resolve MAGs after checkpoint
+############################################
+def get_mags(wildcards):
+    ckpt = checkpoints.select_dastool_bins.get(sample=wildcards.sample)
+    bins_dir = ckpt.output.bins
+    return glob_wildcards(os.path.join(bins_dir, "{mag}.fa")).mag
+
+def get_filtered_mags(wildcards):
+    ckpt = checkpoints.mag_filter.get(sample=wildcards.sample)
+    filt_dir = ckpt.output.filtered
+    return glob_wildcards(os.path.join(filt_dir, "{mag}.fa")).mag
+
+
+# =============================================================================
+# RULE ALL — FINAL TARGETS
+# =============================================================================
+FINAL_TARGETS = [
+    f"{FASTP_DIR}/{SAMPLE}/R1_trimmed.fastq",
+    f"{SR_HOST_DIR}/{SAMPLE}/R1_decontam.fastq",
+    f"{NANOSTAT_DIR}/{SAMPLE}/raw_nanostat.txt",
+    f"{NANOQ_DIR}/{SAMPLE}/filtered.fastq",
+    f"{NANOSTAT_DIR}/{SAMPLE}/filtered_nanostat.txt",
+    f"{LR_HOST_DIR}/{SAMPLE}/decontam.fastq",
+    f"{LR_HOST_DIR}/{SAMPLE}/seqkit_stats.txt",
+    f"{MEGAHIT_DIR}/{SAMPLE}/final.contigs.fa",
+    f"{OPRAMS_DIR}/{SAMPLE}_nostrain/contigs.fasta",
+    f"{QUAST_DIR}/{SAMPLE}/report.html",
+    f"{MAP_DIR}/{SAMPLE}_depth.txt",
+    f"{BIN_DIR}/{SAMPLE}/metabat2.done",
+    f"{BIN_DIR}/{SAMPLE}/semibin2.done",
+    f"{DAS_DIR}/{SAMPLE}_DASTool_bins_clean.done",
+    f"{CHECKM_DIR}/{SAMPLE}/quality_report.tsv",
+    f"{BUSCO_DIR}/{SAMPLE}/busco.done",
+    f"{MAGQC_DIR}/{SAMPLE}/mag_quast.done",
+    f"{MERGED_QC}/{SAMPLE}/combined_quality_summary.tsv",
+    f"{FILTERED_DIR}/{SAMPLE}.filter.done",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.bac120.summary.tsv",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.ar53.summary.tsv",
+    f"{DREP_DIR}/{SAMPLE}/dereplicated_genomes",
+    f"{BARRNAP_DIR}/{SAMPLE}/barrnap.done",
+    f"{BARRNAP_DIR}/{SAMPLE}/all_MAGs_16S_rRNA.fa",
+    f"{BARRNAP_DIR}/{SAMPLE}/16S_detection_summary.tsv",
+    f"{COVERM_DIR}/{SAMPLE}/coverage.tsv",
+    f"{PRODIGAL_DIR}/{SAMPLE}/predicted_genes.ffn",
+    f"{CDHIT_DIR}/{SAMPLE}/gene_catalogue_nr.faa",
+    f"{QUANT_DIR}/{SAMPLE}/gene_counts.txt",
+    f"{MULTIQC_DIR}/{SAMPLE}_collect.done",
+    f"{MULTIQC_DIR}/multiqc_report.html",
+]
+if RUN_KRAKEN:
+    FINAL_TARGETS.append(f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv")
+if RUN_VIRSORTER2:
+    FINAL_TARGETS.append(f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done")
+if RUN_PROKKA_CHAIN:
+    FINAL_TARGETS.append(f"{PROKKA_DIR}/{SAMPLE}/prokka.done")
+if RUN_CCTYPER:
+    FINAL_TARGETS.append(f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done")
+if RUN_DBCAN:
+    FINAL_TARGETS.append(f"{DBCAN_DIR}/{SAMPLE}/dbcan.done")
+if RUN_ABRICATE:
+    FINAL_TARGETS.append(f"{ABRICATE_DIR}/{SAMPLE}/abricate.done")
+if RUN_HADEG:
+    FINAL_TARGETS.append(f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done")
+if RUN_BUSCO_FILTERED:
+    FINAL_TARGETS.append(f"{BUSCO_FILTERED_DIR}/{SAMPLE}/busco_filtered_all.done")
+
+ANALYSIS_TYPE = "metagenomics"
+ANALYSIS_MODE = "hybrid"
+ANALYSIS_ROOT_PATTERN = BASE_PATH
+ANALYSIS_SAMPLE = SAMPLE
+ANALYSIS_PREREQUISITES = list(FINAL_TARGETS)
+FINAL_TARGETS.append(f"{BASE_PATH}/analysis/index.json")
+
+rule all:
+    input: FINAL_TARGETS
+
+include: "/project/workflow/UPDATE_2026/analysis_bundle.smk"
+
+
+# =============================================================================
+# PHASE 1a — SHORT-READ PREPROCESSING
+# =============================================================================
+
+rule fastp:
+    """Short-read QC: adapter trimming, quality filtering, QC report."""
+    input:
+        r1 = config["reads"]["short_r1"],
+        r2 = config["reads"]["short_r2"]
+    output:
+        r1   = f"{FASTP_DIR}/{{sample}}/R1_trimmed.fastq",
+        r2   = f"{FASTP_DIR}/{{sample}}/R2_trimmed.fastq",
+        json = f"{FASTP_DIR}/{{sample}}/fastp.json",
+        html = f"{FASTP_DIR}/{{sample}}/fastp.html"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {FASTP_DIR}/{wildcards.sample}
+        {FASTP} \
+          --in1 {input.r1} --in2 {input.r2} \
+          --out1 {output.r1} --out2 {output.r2} \
+          --json {output.json} --html {output.html} \
+          --detect_adapter_for_pe \
+          --qualified_quality_phred {FASTP_QUALIFIED_Q} \
+          --length_required {FASTP_MIN_LENGTH} \
+          {FASTP_LOW_COMPLEXITY_FLAG} \
+          {FASTP_CUT_FRONT_FLAG} {FASTP_CUT_TAIL_FLAG} \
+          --thread {threads}
+        """
+
+rule kneaddata:
+    """Short-read host removal using kneaddata + bowtie2 database."""
+    input:
+        r1 = f"{FASTP_DIR}/{{sample}}/R1_trimmed.fastq",
+        r2 = f"{FASTP_DIR}/{{sample}}/R2_trimmed.fastq"
+    output:
+        r1  = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        r2  = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq",
+        log = f"{SR_HOST_DIR}/{{sample}}/kneaddata.log"
+    threads: THREADS
+    run:
+        import os
+        os.makedirs(f"{SR_HOST_DIR}/{wildcards.sample}", exist_ok=True)
+        if HOST_DB and (os.path.exists(HOST_DB + ".1.bt2") or
+                        os.path.exists(HOST_DB + ".1.bt2l")):
+            shell(
+                f"set -euo pipefail\n"
+                f"export PATH={KNEADDATA_ENV}:$PATH\n"
+                f"{KNEADDATA} "
+                f"--input1 {input.r1} --input2 {input.r2} "
+                f"--reference-db {HOST_DB} "
+                f"--output {SR_HOST_DIR}/{wildcards.sample}/kneaddata_out "
+                f"--threads {threads} "
+                f"--bypass-trim "
+                f"--bypass-trf "
+                f"--output-prefix {wildcards.sample} "
+                f"--log {output.log}\n"
+                f"cp {SR_HOST_DIR}/{wildcards.sample}/kneaddata_out/"
+                f"{wildcards.sample}_paired_1.fastq {output.r1}\n"
+                f"cp {SR_HOST_DIR}/{wildcards.sample}/kneaddata_out/"
+                f"{wildcards.sample}_paired_2.fastq {output.r2}\n"
+            )
+        else:
+            shell(f"cp {input.r1} {output.r1}")
+            shell(f"cp {input.r2} {output.r2}")
+            shell(f"echo 'No HOST_DB configured; kneaddata skipped.' > {output.log}")
+
+rule kraken2:
+    input:
+        r1 = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        r2 = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq"
+    output:
+        report = f"{KRAKEN_DIR}/{{sample}}_kraken2_report.tsv",
+        out    = f"{KRAKEN_DIR}/{{sample}}_kraken2.out"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {KRAKEN_DIR}
+        export PATH={KRAKEN_ENV}:$PATH
+        [ -f {KRAKEN2_DB}/taxo.k2d ] || {{ echo "[kraken2] ERROR: database missing: {KRAKEN2_DB}" >&2; exit 1; }}
+        command -v {KRAKEN2} >/dev/null 2>&1 || {{ echo "[kraken2] ERROR: executable unavailable: {KRAKEN2}" >&2; exit 1; }}
+        {KRAKEN2} \
+          --db {KRAKEN2_DB} \
+          --threads {threads} \
+          --paired {input.r1} {input.r2} \
+          {KRAKEN_CONFIDENCE_FLAG} \
+          {KRAKEN_MIN_HIT_GROUPS_FLAG} \
+          --report {output.report} \
+          --output {output.out}
+        """
+
+rule bracken:
+    input:
+        report = f"{KRAKEN_DIR}/{{sample}}_kraken2_report.tsv"
+    output:
+        species = f"{KRAKEN_DIR}/{{sample}}_bracken_species.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        export PATH={KRAKEN_ENV}:$PATH
+        [ -f {KRAKEN2_DB}/database{BRACKEN_READ_LENGTH}mers.kmer_distrib ] || {{ echo "[bracken] ERROR: {BRACKEN_READ_LENGTH}-bp database index is missing." >&2; exit 1; }}
+        command -v {BRACKEN} >/dev/null 2>&1 || {{ echo "[bracken] ERROR: executable unavailable: {BRACKEN}" >&2; exit 1; }}
+        {BRACKEN} \
+          -d {KRAKEN2_DB} \
+          -i {input.report} \
+          -o {output.species} \
+          -l {BRACKEN_LEVEL} \
+          -t {BRACKEN_THRESHOLD} \
+          -r {BRACKEN_READ_LENGTH}
+        """
+
+
+# =============================================================================
+# PHASE 1b — LONG-READ PREPROCESSING
+# =============================================================================
+
+rule nanostat_raw:
+    """Raw long-read QC statistics via NanoStat."""
+    input:
+        reads = config["reads"]["long"]
+    output:
+        report = f"{NANOSTAT_DIR}/{{sample}}/raw_nanostat.txt"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {NANOSTAT_DIR}/{wildcards.sample}
+        {NANOSTAT} \
+          --fastq {input.reads} \
+          --threads {threads} \
+          > {output.report}
+        """
+
+rule nanoq_adaptive:
+    """
+    Adaptive long-read quality filter using NanoStat output.
+    TIER 0 (PASS):     mean_Q>=10 AND median_len>=5000 → no filtering
+    TIER 1 (LIGHT):    mean_Q>=8  AND median_len>=2000 → --min-qual 8 --min-len 2000
+    TIER 2 (MODERATE): otherwise                       → --min-qual 7 --min-len 1000
+    """
+    input:
+        reads  = config["reads"]["long"],
+        report = f"{NANOSTAT_DIR}/{{sample}}/raw_nanostat.txt"
+    output:
+        reads   = f"{NANOQ_DIR}/{{sample}}/filtered.fastq",
+        summary = f"{NANOQ_DIR}/{{sample}}/nanoq_summary.txt"
+    threads: THREADS
+    run:
+        import gzip, re, shutil, os
+
+        mean_q = median_len = None
+        with open(input.report) as fh:
+            for line in fh:
+                m = re.search(r"Mean read quality[^:]*:\s+([\d.]+)", line)
+                if m: mean_q = float(m.group(1))
+                m = re.search(r"Median read length[^:]*:\s+([\d,.]+)", line)
+                if m: median_len = float(m.group(1).replace(",", ""))
+
+        if mean_q is None or median_len is None:
+            with open(input.report) as _dbg:
+                content = _dbg.read()
+            raise RuntimeError(
+                f"[nanoq_adaptive] Could not parse NanoStat output: {input.report}\n"
+                f"--- File contents ---\n{content}\n--- End ---"
+            )
+
+        if mean_q >= 10 and median_len >= 5000:
+            tier, min_qual, min_len = 0, None, None
+            tier_name = "PASS (no filtering applied)"
+        elif mean_q >= 8 and median_len >= 2000:
+            tier, min_qual, min_len = 1, 8, 2000
+            tier_name = "LIGHT (--min-qual 8 --min-len 2000)"
+        else:
+            tier, min_qual, min_len = 2, 7, 1000
+            tier_name = "MODERATE (--min-qual 7 --min-len 1000)"
+
+        os.makedirs(f"{NANOQ_DIR}/{wildcards.sample}", exist_ok=True)
+        with open(output.summary, "w") as sw:
+            sw.write(f"Sample:           {wildcards.sample}\n")
+            sw.write(f"Raw mean Q:       {mean_q:.2f}\n")
+            sw.write(f"Raw median len:   {median_len:.0f}\n")
+            sw.write(f"Filter tier:      {tier} — {tier_name}\n")
+
+        if tier == 0:
+            # The declared output is plain FASTQ. Transparently decompress a
+            # gzipped upload instead of copying compressed bytes to .fastq.
+            with open(input.reads, "rb") as src:
+                is_gzip = src.read(2) == b"\x1f\x8b"
+            opener = gzip.open if is_gzip else open
+            with opener(input.reads, "rb") as src, open(output.reads, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        else:
+            shell(
+                f"{NANOQ} "
+                f"--input {input.reads} "
+                f"--output {output.reads} "
+                f"--min-qual {min_qual} "
+                f"--min-len {min_len} "
+                f"--report {NANOQ_DIR}/{wildcards.sample}/nanoq_report.json "
+                f"--stats"
+            )
+        print(f"[nanoq_adaptive] Tier {tier}: {tier_name}")
+
+rule nanostat_filtered:
+    """Run NanoStat on nanoq-filtered long reads for post-filter QC."""
+    input:
+        reads = f"{NANOQ_DIR}/{{sample}}/filtered.fastq"
+    output:
+        report = f"{NANOSTAT_DIR}/{{sample}}/filtered_nanostat.txt"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {NANOSTAT_DIR}/{wildcards.sample}
+        {NANOSTAT} \
+          --fastq {input.reads} \
+          --threads {threads} \
+          > {output.report}
+        test -s {output.report}
+        """
+
+rule host_removal_lr:
+    """Long-read host removal via Minimap2; pass-through if no HOST_REF."""
+    input:
+        reads = f"{NANOQ_DIR}/{{sample}}/filtered.fastq",
+        postfilter_qc = f"{NANOSTAT_DIR}/{{sample}}/filtered_nanostat.txt"
+    output:
+        decontam = f"{LR_HOST_DIR}/{{sample}}/decontam.fastq",
+        stats    = f"{LR_HOST_DIR}/{{sample}}/seqkit_stats.txt"
+    threads: THREADS
+    run:
+        import os
+        os.makedirs(f"{LR_HOST_DIR}/{wildcards.sample}", exist_ok=True)
+        if HOST_REF and os.path.exists(HOST_REF):
+            shell(
+                f"set -euo pipefail\n"
+                f"{MINIMAP2} -ax {MM2_PRESET} -t {threads} {HOST_REF} {input.reads} "
+                f"| {SAMTOOLS} view -b -f 4 "
+                f"| {SAMTOOLS} fastq - > {output.decontam}"
+            )
+        else:
+            shell(f"cp {input.reads} {output.decontam}")
+        shell(f"set -euo pipefail\n{SEQKIT} stats -a {output.decontam} > {output.stats}")
+
+
+# =============================================================================
+# PHASE 2 — HYBRID ASSEMBLY  (MEGAHIT → OPERA-MS → QUAST)
+# =============================================================================
+
+rule megahit_assembly:
+    """Short-read metagenome assembly with MEGAHIT (input contigs for OPERA-MS)."""
+    input:
+        r1 = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        r2 = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq"
+    output:
+        contigs = f"{MEGAHIT_DIR}/{{sample}}/final.contigs.fa"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        rm -rf {MEGAHIT_DIR}/{wildcards.sample}
+        {MEGAHIT} \
+          -1 {input.r1} \
+          -2 {input.r2} \
+          -o {MEGAHIT_DIR}/{wildcards.sample} \
+          -t {threads} \
+          --min-contig-len {MEGAHIT_MIN_CONTIG_LEN} \
+          --k-list 21,29,39,59,79,99,119,141 \
+          --memory 0.8
+        """
+
+rule operams_assembly:
+    """
+    Hybrid assembly with OPERA-MS: MEGAHIT contigs + decontaminated long reads.
+
+    Fixes verified working on this cluster (SRR14300308):
+      1. LD_PRELOAD libnsl.so.1: compute nodes lack this library. It is symlinked
+         from libnsl.so.3 inside the marine conda env:
+           ln -s $CONDA_PREFIX/lib/libnsl.so.3 $CONDA_PREFIX/lib/libnsl.so.1
+         The preload is set before perl is called so all child processes inherit it.
+      2. --genome-db: points to OPERA-MS-DB for reference-guided clustering.
+         Replaces the old --no-ref-clustering flag which caused downstream failures.
+      3. --no-strain-clustering: strain assembly (cluster_strain.pl) crashes on
+         this dataset — known OPERA-MS v0.9.0 bug ("Error in during strain
+         clustering assembly"). Disabling it lets the run complete successfully.
+      4. --no-gap-filling: disabled to reduce runtime and avoid secondary failures.
+      5. Output dir suffix _nostrain distinguishes this run from old broken runs.
+      6. OPERA-MS must create its own --out-dir from scratch; prior runs removed.
+      7. Contig headers sanitised (spaces -> underscores) before passing to
+         OPERA-MS, which rejects headers containing spaces.
+      8. Full stderr+stdout tee-d to log for post-mortem diagnostics.
+      9. Scaffolds file located with version-independent search across all known
+         OPERA-MS output layouts.
+    """
+    input:
+        contigs  = f"{MEGAHIT_DIR}/{{sample}}/final.contigs.fa",
+        long_r   = f"{LR_HOST_DIR}/{{sample}}/decontam.fastq",
+        short_r1 = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        short_r2 = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq"
+    output:
+        contigs   = f"{OPRAMS_DIR}/{{sample}}_nostrain/contigs.fasta"
+    log:
+        f"{OPRAMS_DIR}/{{sample}}_nostrain/operams.log"
+    threads: THREADS
+    params:
+        genome_db = OPERAMS_DB,
+        libnsl    = os.environ.get("LIBNSL_SO", str(Path(OPERAMS_ENV).parent / "lib" / "libnsl.so.1"))
+    shell:
+        r"""
+        set -euo pipefail
+
+        OUTDIR="{OPRAMS_DIR}/{wildcards.sample}_nostrain"
+        LOG="{log}"
+
+        # OPERA-MS contains older helper binaries that may require libnsl.so.1.
+        # Only preload it when the environment actually provides it; exporting
+        # a nonexistent path causes the Perl process to fail before it starts.
+        if [ -f "{params.libnsl}" ]; then
+            export LD_PRELOAD="{params.libnsl}"
+        else
+            unset LD_PRELOAD || true
+        fi
+
+        # 2. Create output dir before tee writes the log (fix: "No such file or directory")
+        #    OPERA-MS is fine with the dir pre-existing as long as internals are absent.
+        rm -rf "$OUTDIR"
+        mkdir -p "$OUTDIR"
+
+        # 3. Sanitise contig headers (spaces break OPERA-MS parser)
+        CLEAN_CONTIGS="$(dirname "$OUTDIR")/contigs_clean_{wildcards.sample}.fa"
+        sed 's/ /_/g' {input.contigs} > "$CLEAN_CONTIGS"
+
+        # 4. Add the server-resolved marine environment to PATH.
+        export PATH={OPERAMS_ENV}:{MARINE_ENV}:$PATH
+
+        # Repair stale absolute links left by older OPERA-MS installations.
+        # OPERA-MS invokes these through its tools directory even when the
+        # top-level command uses the dedicated environment.
+        ln -sfn "{OPERAMS_PERL}" "$(dirname {OPERAMS_PL})/tools_opera_ms/perl"
+        ln -sfn "{OPERAMS_SAMTOOLS}" "$(dirname {OPERAMS_PL})/tools_opera_ms/samtools"
+
+        # 5. Run OPERA-MS with verified-working flags
+        echo "[operams] Starting OPERA-MS run at $(date)" | tee "$LOG"
+        echo "[operams] LD_PRELOAD=${{LD_PRELOAD:-<not set>}}" | tee -a "$LOG"
+        echo "[operams] genome-db: {params.genome_db}" | tee -a "$LOG"
+
+        {OPERAMS_PERL} {OPERAMS_PL} \
+          --contig-file         "$CLEAN_CONTIGS" \
+          --short-read1         {input.short_r1} \
+          --short-read2         {input.short_r2} \
+          --long-read           {input.long_r} \
+          --genome-db           {params.genome_db} \
+          --no-strain-clustering \
+          --no-gap-filling \
+          --no-polishing \
+          --num-processors      {threads} \
+          --out-dir             "$OUTDIR" \
+          2>&1 | tee -a "$LOG"
+
+        echo "[operams] OPERA-MS finished at $(date)" | tee -a "$LOG"
+
+        # 6. Verify contigs.fasta was produced (--no-polishing outputs contigs.fasta directly)
+        if [ ! -s "$OUTDIR/contigs.fasta" ]; then
+            echo "ERROR: OPERA-MS did not produce contigs.fasta" | tee -a "$LOG"
+            echo "Directory listing:" | tee -a "$LOG"
+            find "$OUTDIR" -maxdepth 2 -type f 2>/dev/null | tee -a "$LOG" || true
+            exit 1
+        fi
+        echo "[operams] Found contigs.fasta at: $OUTDIR/contigs.fasta" | tee -a "$LOG"
+
+        rm -f "$CLEAN_CONTIGS"
+        echo "[operams] Done. Output: {output.contigs}" | tee -a "$LOG"
+        """
+
+rule quast:
+    """QUAST assembly QC on OPERA-MS scaffolds."""
+    input:
+        contigs = assembly_fasta
+    output:
+        html = f"{QUAST_DIR}/{{sample}}/report.html"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {QUAST_DIR}/{wildcards.sample}
+        {QUAST} {input.contigs} \
+          -o {QUAST_DIR}/{wildcards.sample} \
+          -t {threads}
+        """
+
+
+# =============================================================================
+# PHASE 3 — HYBRID READ MAPPING AND BINNING
+# =============================================================================
+
+rule bowtie2_index:
+    """Build bowtie2 index of OPERA-MS scaffolds for short-read mapping."""
+    input:
+        contigs = assembly_fasta
+    output:
+        done = f"{MAP_DIR}/{{sample}}_bt2index.done"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {MAP_DIR}
+        {BOWTIE2_BUILD} \
+          --threads {threads} \
+          {input.contigs} \
+          {MAP_DIR}/{wildcards.sample}_index
+        touch {output.done}
+        """
+
+rule bowtie2_map:
+    """Map decontaminated short reads to OPERA-MS scaffolds."""
+    input:
+        r1   = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        r2   = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq",
+        done = f"{MAP_DIR}/{{sample}}_bt2index.done"
+    output:
+        bam = f"{MAP_DIR}/{{sample}}_sr.sorted.bam"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        {BOWTIE2} \
+          -x {MAP_DIR}/{wildcards.sample}_index \
+          -1 {input.r1} \
+          -2 {input.r2} \
+          -p {threads} \
+          --no-unal \
+        | {SAMTOOLS} sort -@ {threads} -o {output.bam}
+        {SAMTOOLS} index {output.bam}
+        """
+
+rule minimap2_map:
+    """Map decontaminated long reads to OPERA-MS scaffolds."""
+    input:
+        reads   = f"{LR_HOST_DIR}/{{sample}}/decontam.fastq",
+        contigs = assembly_fasta
+    output:
+        bam = f"{MAP_DIR}/{{sample}}_lr.sorted.bam"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        {MINIMAP2} \
+          -ax {MM2_PRESET} \
+          -t {threads} \
+          {input.contigs} {input.reads} \
+        | {SAMTOOLS} sort -@ {threads} -o {output.bam}
+        {SAMTOOLS} index {output.bam}
+        """
+
+rule merge_bams:
+    """Merge short-read and long-read BAMs for unified depth calculation."""
+    input:
+        sr_bam = f"{MAP_DIR}/{{sample}}_sr.sorted.bam",
+        lr_bam = f"{MAP_DIR}/{{sample}}_lr.sorted.bam"
+    output:
+        bam = f"{MAP_DIR}/{{sample}}.sorted.bam"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        {SAMTOOLS} merge -f -@ {threads} {output.bam} {input.sr_bam} {input.lr_bam}
+        {SAMTOOLS} index {output.bam}
+        """
+
+rule depth:
+    """Calculate per-contig depth from merged BAM for MetaBAT2."""
+    input:
+        bam = f"{MAP_DIR}/{{sample}}.sorted.bam"
+    output:
+        depth = f"{MAP_DIR}/{{sample}}_depth.txt"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={BINNING_ENV}:$PATH
+        {JGI} --outputDepth {output.depth} {input.bam}
+        """
+
+rule metabat2:
+    """MetaBAT2 binning using merged hybrid depth."""
+    input:
+        contigs = assembly_fasta,
+        depth   = f"{MAP_DIR}/{{sample}}_depth.txt"
+    output:
+        bins = directory(f"{BIN_DIR}/{{sample}}/metabat2"),
+        done = f"{BIN_DIR}/{{sample}}/metabat2.done"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {output.bins}
+        export PATH={BINNING_ENV}:$PATH
+        {METABAT2} \
+          -i {input.contigs} \
+          -a {input.depth} \
+          -o {output.bins}/{SAMPLE}_bin \
+          -t {threads}
+        touch {output.done}
+        """
+
+rule semibin2:
+    """
+    SemiBin2 binning.
+
+    FIXES vs the broken shell rule that was executing:
+      1. Binary name: find the actual executable (SemiBin2 or SemiBin) at
+         runtime rather than hardcoding — avoids the 'No such file' exit 127.
+      2. BAM input: this hybrid pipeline has a merged BAM (lr+sr). Use the
+         merged BAM for binning depth, not the sr-only BAM.
+      3. Sequencing type: changed to long_read because the assembly is
+         long-read (ONT via OPERA-MS); using short_read model on a long-read
+         assembly degrades bin quality.
+      4. Self-supervised first, fall back to --environment global on failure.
+      5. Non-fatal: touch done and create empty output_bins on total failure
+         so the DAG can continue to DAS_Tool / MetaBAT2-only mode.
+    """
+    input:
+        contigs = assembly_fasta,
+        bam     = f"{MAP_DIR}/{{sample}}.sorted.bam"   # merged BAM, not sr-only
+    output:
+        bins = directory(f"{BIN_DIR}/{{sample}}/semibin2/output_bins"),
+        done = f"{BIN_DIR}/{{sample}}/semibin2.done"
+    threads: THREADS
+    resources:
+        gpu = 1
+    run:
+        import subprocess, os as _os, glob as _glob, shutil
+
+        semibin_outdir = f"{BIN_DIR}/{wildcards.sample}/semibin2"
+        _os.makedirs(semibin_outdir, exist_ok=True)
+
+        # ── Resolve actual binary name (SemiBin2 >= 2.x renamed to SemiBin2) ─
+        binning_bin = SEMIBIN_ENV or BINNING_ENV
+        if _os.path.exists(f"{binning_bin}/SemiBin2"):
+            semibin_exe = f"{binning_bin}/SemiBin2"
+        elif _os.path.exists(f"{binning_bin}/SemiBin"):
+            semibin_exe = f"{binning_bin}/SemiBin"
+        else:
+            # Last resort: rely on PATH
+            semibin_exe = "SemiBin2"
+        print(f"[semibin2] Using binary: {semibin_exe}", flush=True)
+
+        # ── Pre-check: skip if no contigs ────────────────────────────────────
+        contig_count = 0
+        try:
+            with open(input.contigs) as fh:
+                contig_count = sum(1 for l in fh if l.startswith(">"))
+        except Exception:
+            pass
+
+        if contig_count == 0:
+            print("[semibin2] WARNING: FASTA is empty. Skipping SemiBin2.", flush=True)
+            _os.makedirs(output.bins, exist_ok=True)
+            open(output.done, "w").close()
+            return
+
+        def run_semibin(mode_flag):
+            cmd = (
+                f"set -euo pipefail\n"
+                f"export PATH={binning_bin}:$PATH\n"
+                f"{semibin_exe} single_easy_bin "
+                f"  -i {input.contigs} "
+                f"  -b {input.bam} "
+                f"  -o {semibin_outdir} "
+                f"  --threads {threads} "
+                f"  --min-len {SEMIBIN_MIN_LEN} "
+                f"  --engine {SEMIBIN_ENGINE} "
+                f"  --sequencing-type long_read "   # FIX: long_read for ONT assembly
+                f"  {mode_flag}"
+            )
+            result = subprocess.run(["bash", "-c", cmd])
+            return result.returncode
+
+        # ── Try self-supervised, fall back to global preset ──────────────────
+        rc = run_semibin("--self-supervised")
+        bins_found = (
+            _glob.glob(f"{semibin_outdir}/output_bins/*.fa")    +
+            _glob.glob(f"{semibin_outdir}/output_bins/*.fasta") +
+            _glob.glob(f"{semibin_outdir}/output_bins/*.fa.gz")  # SemiBin2 2.x writes .fa.gz
+        )
+
+        if rc != 0 or len(bins_found) == 0:
+            print(
+                "[semibin2] --self-supervised failed or produced 0 bins. "
+                f"Retrying with --environment {SEMIBIN_ENVIRONMENT}.",
+                flush=True
+            )
+            if _os.path.exists(semibin_outdir):
+                shutil.rmtree(semibin_outdir)
+            _os.makedirs(semibin_outdir, exist_ok=True)
+            rc2 = run_semibin(f"--environment {SEMIBIN_ENVIRONMENT}")
+            bins_found = (
+                _glob.glob(f"{semibin_outdir}/output_bins/*.fa")    +
+                _glob.glob(f"{semibin_outdir}/output_bins/*.fasta") +
+                _glob.glob(f"{semibin_outdir}/output_bins/*.fa.gz")  # SemiBin2 2.x writes .fa.gz
+            )
+            if rc2 != 0 and len(bins_found) == 0:
+                print(
+                    "[semibin2] WARNING: Both modes produced 0 bins. "
+                    "Continuing with MetaBAT2-only binning.",
+                    flush=True
+                )
+
+        _os.makedirs(output.bins, exist_ok=True)
+        print(f"[semibin2] Produced {len(bins_found)} bin(s) in {output.bins}", flush=True)
+        open(output.done, "w").close()
+        
+
+rule metabat2_to_contig2bin:
+    """
+    Convert MetaBAT2 bins → DAS_Tool contig2bin TSV.
+    Header row written for human readability; dastool rule strips it with tail -n +2.
+    """
+    input:
+        done = f"{BIN_DIR}/{{sample}}/metabat2.done",
+        bins = f"{BIN_DIR}/{{sample}}/metabat2"
+    output:
+        tsv = f"{BIN_DIR}/{{sample}}/metabat2_contig2bin.tsv"
+    run:
+        import glob as _glob
+        rows = []
+        for fa in _glob.glob(f"{input.bins}/*.fa"):
+            bin_id = os.path.splitext(os.path.basename(fa))[0]
+            with open(fa) as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        ctg = line[1:].strip().split()[0]
+                        rows.append(f"{ctg}\t{bin_id}")
+        with open(output.tsv, "w") as out:
+            out.write("contig\tbin_id\n")
+            if rows:
+                out.write("\n".join(rows) + "\n")
+        print(f"[metabat2_to_contig2bin] Wrote {len(rows)} contig mappings → {output.tsv}")
+
+rule semibin2_to_contig2bin:
+    """
+    Convert SemiBin2 bins → DAS_Tool contig2bin TSV.
+
+    FIX: SemiBin2 >= 2.0 writes bins as .fa.gz (not .fa/.fasta).
+    Glob all three extensions. Decompress .gz on the fly with gzip.open().
+    Header row written for human readability; dastool rule strips it.
+    """
+    input:
+        bins = f"{BIN_DIR}/{{sample}}/semibin2/output_bins",
+        done = f"{BIN_DIR}/{{sample}}/semibin2.done"
+    output:
+        tsv  = f"{BIN_DIR}/{{sample}}/semibin2_contig2bin.tsv"
+    run:
+        import glob as _glob, gzip, os
+
+        rows = []
+        patterns = (
+            _glob.glob(f"{input.bins}/*.fa")    +
+            _glob.glob(f"{input.bins}/*.fasta") +
+            _glob.glob(f"{input.bins}/*.fa.gz")        # FIX: SemiBin2 2.x writes .fa.gz
+        )
+
+        for fa in patterns:
+            bin_id = os.path.splitext(os.path.basename(fa))[0]
+            if fa.endswith(".gz"):
+                bin_id = os.path.splitext(bin_id)[0]   # strip .fa from .fa.gz stem
+                fh = gzip.open(fa, "rt")
+            else:
+                fh = open(fa)
+            with fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        ctg = line[1:].strip().split()[0]
+                        rows.append(f"{ctg}\t{bin_id}")
+
+        with open(output.tsv, "w") as out:
+            out.write("contig\tbin_id\n")
+            if rows:
+                out.write("\n".join(rows) + "\n")
+
+        print(f"[semibin2_to_contig2bin] Wrote {len(rows)} contig mappings → {output.tsv}")
+
+
+rule dastool:
+    """
+    Bin refinement with DAS_Tool.
+
+    FIXES vs the broken shell rule:
+      1. Strip header rows from both TSVs before passing to DAS_Tool
+         (DAS_Tool R fread crashes on files with a header — empty or not).
+      2. Check row counts AFTER stripping; skip any binner with 0 data rows
+         so DAS_Tool never receives an empty input file.
+      3. If BOTH binners produced 0 rows: skip DAS_Tool entirely,
+         create empty output dirs, touch done — pipeline continues.
+      4. Output dir `output.bins` is the actual DAS_Tool _DASTool_bins dir;
+         created with mkdir -p as safety after DAS_Tool runs.
+    """
+    input:
+        metabat = f"{BIN_DIR}/{{sample}}/metabat2_contig2bin.tsv",
+        semibin = f"{BIN_DIR}/{{sample}}/semibin2_contig2bin.tsv",
+        contigs = assembly_fasta
+    output:
+        bins = directory(f"{DAS_DIR}/{{sample}}_DASTool_bins"),
+        done = f"{DAS_DIR}/{{sample}}.dastool.done"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        export PATH={BINNING_ENV}:$PATH
+        mkdir -p {DAS_DIR}
+
+        BINDIR="{BIN_DIR}/{wildcards.sample}"
+        PREFIX="{DAS_DIR}/{wildcards.sample}"
+
+        # ── Strip header row (line 1) from each TSV ──────────────────────────
+        MB_CLEAN="$BINDIR/metabat2_contig2bin.clean.tsv"
+        SB_CLEAN="$BINDIR/semibin2_contig2bin.clean.tsv"
+
+        tail -n +2 "{input.metabat}" > "$MB_CLEAN" || true
+        tail -n +2 "{input.semibin}" > "$SB_CLEAN" || true
+
+        mb_rows=$(wc -l < "$MB_CLEAN" | tr -d '[:space:]')
+        sb_rows=$(wc -l < "$SB_CLEAN" | tr -d '[:space:]')
+        mb_rows="${{mb_rows:-0}}"
+        sb_rows="${{sb_rows:-0}}"
+
+        echo "[dastool] MetaBAT2 data rows: $mb_rows  |  SemiBin2 data rows: $sb_rows"
+
+        # ── Build -i / -l from whichever binners have data ───────────────────
+        INPUT_TSVS=""
+        LABELS=""
+
+        if [ "$mb_rows" -gt 0 ] && [ "$sb_rows" -gt 0 ]; then
+            INPUT_TSVS="$MB_CLEAN,$SB_CLEAN"
+            LABELS="metabat2,semibin2"
+        elif [ "$mb_rows" -gt 0 ]; then
+            INPUT_TSVS="$MB_CLEAN"
+            LABELS="metabat2"
+        elif [ "$sb_rows" -gt 0 ]; then
+            INPUT_TSVS="$SB_CLEAN"
+            LABELS="semibin2"
+        else
+            echo "[dastool] WARNING: both binners produced 0 bins — skipping DAS_Tool." >&2
+            mkdir -p "{output.bins}"
+            touch "{output.done}"
+            exit 0
+        fi
+
+        echo "[dastool] Running DAS_Tool: -i $INPUT_TSVS -l $LABELS"
+
+        {DASTOOL} \
+          -i "$INPUT_TSVS" \
+          -l "$LABELS" \
+          -c {input.contigs} \
+          -o "$PREFIX" \
+          -t {threads} \
+          --score_threshold 0.2 \
+          --write_bins
+
+        # Safety: ensure output dir exists even if DAS_Tool produced 0 refined bins
+        mkdir -p "{output.bins}"
+
+        bc=$(find "{output.bins}" -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        echo "[dastool] Produced ${{bc:-0}} refined bin(s) in {output.bins}"
+
+        touch "{output.done}"
+        """
+
+# =============================================================================
+# CHECKPOINT: select_dastool_bins
+# Copies DAS_Tool refined bins to a clean directory, normalising .fa.fa double
+# extensions produced when SemiBin2 bins pass through DAS_Tool --write_bins.
+# Declared as a checkpoint so get_mags() can resolve the MAG list at DAG time.
+# =============================================================================
+
+checkpoint select_dastool_bins:
+    """
+    Copy DAS_Tool refined bins to a clean directory.
+    Handles .fa.fa double-extension produced when SemiBin2 bins (SemiBin_N.fa)
+    pass through DAS_Tool --write_bins, which appends another .fa extension.
+    All files are normalised to a single .fa name in the output directory.
+    Skips *_sub.fa files (DAS_Tool internal subscaffold artefacts).
+    Must be a checkpoint (not a plain rule) so that get_mags() — which calls
+    checkpoints.select_dastool_bins.get() — is resolved correctly by Snakemake.
+    """
+    input:
+        bins_dir = f"{DAS_DIR}/{{sample}}_DASTool_bins",
+        done     = f"{DAS_DIR}/{{sample}}.dastool.done"
+    output:
+        bins = directory(f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"),
+        done = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean.done"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {output.bins}
+        shopt -s nullglob
+
+        copied=0
+
+        # Collect .fa and .fa.fa — DAS_Tool writes SemiBin_N.fa.fa
+        # when SemiBin2 bins named SemiBin_N.fa pass through --write_bins
+        for f in {input.bins_dir}/*.fa {input.bins_dir}/*.fa.fa; do
+            [ -f "$f" ] || continue
+
+            filename=$(basename "$f")
+
+            # Normalise to single .fa extension
+            case "$filename" in
+                *.fa.fa) clean_name="${{filename%.fa.fa}}.fa" ;;
+                *.fa)    clean_name="$filename" ;;
+                *)       continue ;;
+            esac
+
+            # Skip DAS_Tool subscaffold artefacts (*_sub.fa)
+            case "${{clean_name%.fa}}" in
+                *_sub) continue ;;
+            esac
+
+            cp "$f" "{output.bins}/$clean_name"
+            copied=$(( copied + 1 ))
+        done
+
+        echo "[select_dastool_bins] Copied $copied bin(s) to {output.bins}"
+
+        bin_count=$(find {output.bins} -maxdepth 1 -name "*.fa" \
+            | wc -l | tr -d "[:space:]")
+        bin_count="${{bin_count:-0}}"
+        echo "[select_dastool_bins] Retained $bin_count final MAG bin(s)"
+
+        touch {output.done}
+        """
+
+
+# =============================================================================
+# PHASE 4 — MAG QUALITY ASSESSMENT
+# CheckM2 ‖ BUSCO (parallel bash-jobs loop) ‖ QUAST-per-MAG
+# GUNC REMOVED — no longer part of QC or filtering.
+# =============================================================================
+
+rule checkm2:
+    input:
+        bins = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        report = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv"
+    threads: THREADS
+    params:
+        diamond_db = CHECKM2_DB
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {CHECKM_DIR}/{wildcards.sample}
+        bin_count=$(find {input.bins} -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        bin_count="${{bin_count:-0}}"
+        if [ "$bin_count" -eq 0 ]; then
+          printf "Name\tCompleteness\tContamination\n" > {output.report}
+          echo "[checkm2] No final bins — writing an empty quality report." >&2
+          exit 0
+        fi
+        export PATH={CHECKM2_ENV}:{PROKKA_ENV}:$PATH
+        {CHECKM2} predict \
+          --input {input.bins} \
+          --output-directory {CHECKM_DIR}/{wildcards.sample} \
+          --threads {threads} \
+          -x fa \
+          --force \
+          --database_path {params.diamond_db}
+        """
+
+rule busco:
+    """
+    BUSCO on DAS_Tool bins (pre-filter QC).
+    Parallel bash-jobs loop; --offline + explicit lineage.
+    """
+    input:
+        bins = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        done = f"{BUSCO_DIR}/{{sample}}/busco.done"
+    threads: THREADS
+    params:
+        parallel_jobs = max(1, THREADS // 4),
+        lineage = BUSCO_LINEAGE
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {BUSCO_DIR}/{wildcards.sample}
+        export PATH={BUSCO_ENV}:$PATH
+
+        OUTDIR="{BUSCO_DIR}/{wildcards.sample}"
+        LINEAGE="{params.lineage}"
+        MAX_JOBS={params.parallel_jobs}
+        FAIL_FILE="$OUTDIR/.busco_failed"
+        rm -f "$FAIL_FILE"
+        active=0
+
+        for fa in {input.bins}/*.fa; do
+            [ -f "$fa" ] || continue
+            mag=$(basename "$fa" .fa)
+            echo "[BUSCO] Launching $mag"
+            (
+                {BUSCO_BIN} \
+                  -i "$fa" \
+                  -o "$mag" \
+                  --out_path "$OUTDIR" \
+                  -m genome \
+                  -l "$LINEAGE" \
+                  --offline \
+                  -c 4 \
+                  --force 2>&1 || {{ echo "[BUSCO] ERROR: $mag failed" >&2; touch "$FAIL_FILE"; }}
+            ) &
+            active=$(( active + 1 ))
+            if [ "$active" -ge "$MAX_JOBS" ]; then
+                wait
+                active=0
+            fi
+        done
+        wait
+
+        if [ -f "$FAIL_FILE" ]; then
+            rm -f "$FAIL_FILE"
+            echo "[BUSCO] One or more MAG analyses failed." >&2
+            exit 1
+        fi
+
+        touch {output.done}
+        """
+
+rule quast_per_mag:
+    input:
+        fasta = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean/{{mag}}.fa"
+    output:
+        tsv = f"{MAGQC_DIR}/{{sample}}/{{mag}}/report.tsv"
+    threads: 1
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {MAGQC_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={QUAST_ENV}:$PATH
+        {QUAST_BIN} {input.fasta} \
+          -o {MAGQC_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --no-html --no-plots
+        """
+
+rule quast_per_mag_all:
+    input:
+        lambda wildcards: expand(
+            f"{MAGQC_DIR}/{{sample}}/{{mag}}/report.tsv",
+            sample=wildcards.sample,
+            mag=get_mags(wildcards)
+        )
+    output:
+        done = f"{MAGQC_DIR}/{{sample}}/mag_quast.done"
+    shell:
+        "touch {output.done}"
+
+rule merge_mag_qc:
+    """
+    Merge CheckM2 + BUSCO + QUAST-per-MAG into one summary TSV.
+    GUNC removed: mimag_tier() uses completeness + contamination only.
+    """
+    input:
+        checkm2 = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv",
+        busco   = f"{BUSCO_DIR}/{{sample}}/busco.done",
+        mag_qc  = f"{MAGQC_DIR}/{{sample}}/mag_quast.done"
+    output:
+        summary = f"{MERGED_QC}/{{sample}}/combined_quality_summary.tsv"
+    params:
+        busco_dir = f"{BUSCO_DIR}/{{sample}}",
+        magqc_dir = f"{MAGQC_DIR}/{{sample}}"
+    run:
+        import pandas as pd
+        import os, re, glob as _glob
+
+        ckm = pd.read_csv(input.checkm2, sep="\t")
+        ckm = ckm.rename(columns={
+            "Name": "MAG",
+            "Completeness": "checkm2_completeness",
+            "Contamination": "checkm2_contamination"
+        })[["MAG", "checkm2_completeness", "checkm2_contamination"]]
+
+        busco_rows = []
+        for summary_file in _glob.glob(
+            os.path.join(params.busco_dir, "**", "short_summary*.txt"),
+            recursive=True
+        ):
+            mag = os.path.basename(os.path.dirname(summary_file))
+            with open(summary_file) as fh:
+                content = fh.read()
+            c_pct = s_pct = d_pct = None
+            compact = re.search(
+                r"C:([\d.]+)%\[S:([\d.]+)%,D:([\d.]+)%\]",
+                content,
+            )
+            if compact:
+                c_pct, s_pct, d_pct = map(float, compact.groups())
+            busco_rows.append({
+                "MAG": mag,
+                "busco_complete":   c_pct,
+                "busco_single":     s_pct,
+                "busco_duplicated": d_pct
+            })
+        bus = pd.DataFrame(busco_rows) if busco_rows else pd.DataFrame(
+            columns=["MAG", "busco_complete", "busco_single", "busco_duplicated"])
+
+        qst_rows = []
+        for tsv in _glob.glob(os.path.join(params.magqc_dir, "*/report.tsv")):
+            mag = os.path.basename(os.path.dirname(tsv))
+            df  = pd.read_csv(tsv, sep="\t", header=None, names=["metric", "value"])
+            row = {"MAG": mag}
+            for _, r in df.iterrows():
+                if "N50" in r["metric"]:
+                    row["quast_N50"] = r["value"]
+                elif "Total length" in r["metric"] and ">" not in r["metric"]:
+                    row["quast_total_length"] = r["value"]
+                elif "# contigs" in r["metric"] and ">" not in r["metric"]:
+                    row["quast_num_contigs"] = r["value"]
+                elif "GC (%)" in r["metric"]:
+                    row["quast_GC_pct"] = r["value"]
+            qst_rows.append(row)
+        qst = pd.DataFrame(qst_rows) if qst_rows else pd.DataFrame(
+            columns=["MAG", "quast_N50", "quast_total_length",
+                     "quast_num_contigs", "quast_GC_pct"])
+
+        merged = ckm.merge(bus, on="MAG", how="left") \
+                    .merge(qst, on="MAG", how="left")
+
+        def mimag_tier(row):
+            c_raw = row.get("checkm2_completeness")
+            ct_raw = row.get("checkm2_contamination")
+            c = float(c_raw) if pd.notna(c_raw) else 0.0
+            ct = float(ct_raw) if pd.notna(ct_raw) else 100.0
+            if c >= HIGH_COMPLETENESS and ct < HIGH_CONTAMINATION:
+                return "High Quality"
+            elif c >= MEDIUM_COMPLETENESS and ct < MEDIUM_CONTAMINATION:
+                return "Medium Quality"
+            else:
+                return "Low Quality"
+
+        merged["MIMAG_tier"] = merged.apply(mimag_tier, axis=1)
+        os.makedirs(os.path.dirname(output.summary), exist_ok=True)
+        merged.to_csv(output.summary, sep="\t", index=False)
+        print(f"[merge_mag_qc] Written {len(merged)} MAGs → {output.summary}")
+
+checkpoint mag_filter:
+    """
+    Filter MAGs: completeness ≥50%, contamination <10%.
+    GUNC removed — chimeric detection no longer applied.
+    """
+    input:
+        summary  = f"{MERGED_QC}/{{sample}}/combined_quality_summary.tsv",
+        bins_dir = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        filtered = directory(f"{FILTERED_DIR}/{{sample}}"),
+        rejected = directory(f"{REJECTED_DIR}/{{sample}}"),
+        done     = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    run:
+        import pandas as pd, shutil, os
+
+        os.makedirs(output.filtered, exist_ok=True)
+        os.makedirs(output.rejected, exist_ok=True)
+
+        df = pd.read_csv(input.summary, sep="\t")
+        log_lines = ["MAG\tAction\tReason"]
+
+        for _, row in df.iterrows():
+            mag = row["MAG"]
+            src = os.path.join(input.bins_dir, f"{mag}.fa")
+            if not os.path.exists(src):
+                continue
+            reasons = []
+            comp_raw = row.get("checkm2_completeness")
+            cont_raw = row.get("checkm2_contamination")
+            comp = float(comp_raw) if pd.notna(comp_raw) else 0.0
+            cont = float(cont_raw) if pd.notna(cont_raw) else 100.0
+            if comp < MIN_COMPLETENESS:
+                reasons.append(f"completeness={comp:.1f}%<{MIN_COMPLETENESS}%")
+            if cont >= MAX_CONTAMINATION:
+                reasons.append(f"contamination={cont:.1f}%>={MAX_CONTAMINATION}%")
+
+            if reasons:
+                shutil.copy(src, os.path.join(output.rejected, f"{mag}.fa"))
+                log_lines.append(f"{mag}\tREJECTED\t{'; '.join(reasons)}")
+            else:
+                shutil.copy(src, os.path.join(output.filtered, f"{mag}.fa"))
+                log_lines.append(f"{mag}\tPASSED\t{row['MIMAG_tier']}")
+
+        with open(os.path.join(output.filtered, "filter_log.tsv"), "w") as fh:
+            fh.write("\n".join(log_lines))
+        open(output.done, "w").close()
+        print(f"[mag_filter] Filter complete. Log: {output.filtered}/filter_log.tsv")
+
+
+# =============================================================================
+# PHASE 5A — MAG-LEVEL ANALYSIS
+# =============================================================================
+
+# ── GTDB-Tk ──────────────────────────────────────────────────────────────────
+rule gtdbtk:
+    """
+    GTDB-Tk taxonomic classification.
+    Using identical shell block to the working long-read pipeline rule.
+    --skip_ani_screen removed: not supported by gtdbk_env (v2.7.2).
+    """
+    input:
+        bins = f"{FILTERED_DIR}/{{sample}}",
+        done = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    output:
+        bac  = f"{GTDB_DIR}/{{sample}}/gtdbtk.bac120.summary.tsv",
+        ar   = f"{GTDB_DIR}/{{sample}}/gtdbtk.ar53.summary.tsv"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {GTDB_DIR}/{wildcards.sample}
+        export PATH={GTDBTK_ENV}:$PATH
+        export GTDBTK_DATA_PATH={GTDBTK_DB}
+        bin_count=$(find {input.bins} -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        bin_count="${{bin_count:-0}}"
+        if [ "$bin_count" -eq 0 ]; then
+            echo -e "user_genome\tclassification" > {output.bac}
+            echo -e "user_genome\tclassification" > {output.ar}
+            echo "[gtdbtk] No filtered MAGs — writing empty summaries." >&2
+            exit 0
+        fi
+        {GTDBTK} classify_wf \
+          --genome_dir {input.bins} \
+          --out_dir {GTDB_DIR}/{wildcards.sample} \
+          --extension fa \
+          --cpus {threads} \
+          --pplacer_cpus 1
+        [ -f {output.bac} ] || printf "user_genome\tclassification\n" > {output.bac}
+        [ -f {output.ar}  ] || printf "user_genome\tclassification\n" > {output.ar}
+        """
+
+# ── dRep — quality-weighted dereplication ────────────────────────────────────
+rule drep:
+    """
+    Dereplication with dRep.
+
+    FIXES:
+      1. --processors (not -p) is dRep's correct thread flag.
+      2. --S_algorithm: auto-detect skani → fastANI → ANImf at runtime.
+         fastANI was hardcoded but is not installed in drep_env.
+         skani ships with dRep >= 3.4 and is the preferred default.
+      3. genome_info CSV uses bare basename (not full path) in the genome
+         column — dRep resolves paths via -g; full paths caused key mismatches.
+      4. Runtime failures propagate so non-dereplicated MAGs are never silently
+         presented as a successful dRep result.
+      5. Stale work directory (log/ subdir present) removed before re-run.
+      6. No-MAG and single-MAG edge cases handled without crashing.
+    """
+    input:
+        bins    = f"{FILTERED_DIR}/{{sample}}",
+        done    = f"{FILTERED_DIR}/{{sample}}.filter.done",
+        checkm2 = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv"
+    output:
+        derep = directory(f"{DREP_DIR}/{{sample}}/dereplicated_genomes")
+    threads: THREADS
+    run:
+        import os, shutil, subprocess, csv as _csv
+
+        drep_env = {**os.environ,
+                    "PATH": f"{DREP_ENV}:{os.environ.get('PATH', '')}"}
+
+        out_base = f"{DREP_DIR}/{wildcards.sample}"
+        os.makedirs(out_base, exist_ok=True)
+
+        fa_files = sorted(
+            os.path.join(input.bins, f)
+            for f in os.listdir(input.bins)
+            if f.endswith(".fa")
+        )
+
+        # ── Edge: no filtered MAGs ────────────────────────────────────────────
+        if len(fa_files) == 0:
+            os.makedirs(output.derep, exist_ok=True)
+            print("[drep] No filtered MAGs — skipping dereplication.", flush=True)
+            return
+
+        # ── Edge: only 1 MAG — dRep needs >=2 for clustering ─────────────────
+        if len(fa_files) == 1:
+            print("[drep] Only 1 MAG — skipping dRep, copying directly.", flush=True)
+            os.makedirs(output.derep, exist_ok=True)
+            shutil.copy(fa_files[0], os.path.join(output.derep, os.path.basename(fa_files[0])))
+            return
+
+        # ── Remove stale dRep work dir BEFORE writing genome_info.csv ─────────
+        # CRITICAL: must happen before genome_info.csv is written — previously
+        # the CSV was written first then rmtree deleted it, causing FileNotFoundError
+        if os.path.isdir(os.path.join(out_base, "log")):
+            shutil.rmtree(out_base)
+            print(f"[drep] Removed stale work dir: {out_base}", flush=True)
+        os.makedirs(out_base, exist_ok=True)
+        os.makedirs(output.derep, exist_ok=True)
+
+        # ── Build genomeInfo CSV from CheckM2 output ──────────────────────────
+        genome_info_path = os.path.join(out_base, "genome_info.csv")
+        checkm2_data = {}
+        try:
+            import pandas as _pd
+            ckm = _pd.read_csv(input.checkm2, sep="\t")
+            for _, row in ckm.iterrows():
+                stem = os.path.splitext(os.path.basename(str(row.get("Name", "")).strip()))[0]
+                comp_raw = row.get("Completeness")
+                cont_raw = row.get("Contamination")
+                checkm2_data[stem] = (
+                    float(comp_raw) if _pd.notna(comp_raw) else 50.0,
+                    float(cont_raw) if _pd.notna(cont_raw) else 5.0,
+                )
+            print(f"[drep] Parsed CheckM2 data for {len(checkm2_data)} genome(s).", flush=True)
+        except Exception as e:
+            print(f"[drep] WARNING: could not parse CheckM2 ({e}), using defaults.", flush=True)
+
+        with open(genome_info_path, "w", newline="") as gh:
+            writer = _csv.writer(gh)
+            writer.writerow(["genome", "completeness", "contamination"])
+            for fa in fa_files:
+                stem = os.path.splitext(os.path.basename(fa))[0]
+                comp, cont = checkm2_data.get(stem, (50.0, 5.0))
+                writer.writerow([os.path.basename(fa), comp, cont])  # basename only
+        print(f"[drep] genome_info → {genome_info_path}", flush=True)
+
+        # ── Detect best available ANI algorithm in drep_env ───────────────────
+        def _avail(binary):
+            return subprocess.run(
+                ["bash", "-c", f"command -v {binary}"],
+                capture_output=True, env=drep_env
+            ).returncode == 0
+
+        if _avail("skani"):
+            s_algo = "skani"
+        elif _avail("fastANI"):
+            s_algo = "fastANI"
+        else:
+            s_algo = "ANImf"
+        print(f"[drep] Using S_algorithm: {s_algo}", flush=True)
+
+        # ── Run dRep ──────────────────────────────────────────────────────────
+        cmd = [
+            DREP_BIN, "dereplicate", out_base,
+            "--genomeInfo", genome_info_path,
+            "-pa", str(DREP_PRIMARY_ANI),
+            "-sa", str(DREP_SECONDARY_ANI),
+            "-nc", str(DREP_ALIGNED_FRACTION),
+            "-comp", str(DREP_MIN_COMPLETENESS),
+            "-con", str(DREP_MAX_CONTAMINATION),
+            "--S_algorithm", s_algo,
+            "--processors", str(threads),   # FIX: was -p, dRep flag is --processors
+        ] + ["-g"] + fa_files
+
+        print(f"[drep] Running: {' '.join(cmd)}", flush=True)
+        subprocess.run(cmd, check=True, env=drep_env)
+        print(f"[drep] Finished. Output: {output.derep}", flush=True)
+
+# ── CoverM — MAG coverage ─────────────────────────────────────────────────────
+rule coverm:
+    input:
+        bins = f"{FILTERED_DIR}/{{sample}}",
+        done = f"{FILTERED_DIR}/{{sample}}.filter.done",
+        bam  = f"{MAP_DIR}/{{sample}}.sorted.bam"
+    output:
+        tsv = f"{COVERM_DIR}/{{sample}}/coverage.tsv"
+    threads: THREADS
+    run:
+        import os
+        out_dir = f"{COVERM_DIR}/{wildcards.sample}"
+        os.makedirs(out_dir, exist_ok=True)
+        bin_files = [
+            os.path.join(input.bins, f)
+            for f in os.listdir(input.bins)
+            if f.endswith(".fa")
+        ]
+        if not bin_files:
+            with open(output.tsv, "w") as fh:
+                fh.write("Genome\tMean\tRelative Abundance (%)\tCovered Fraction\n")
+            print("[coverm] No filtered MAGs — writing empty coverage table.")
+        else:
+            bin_str = " ".join(bin_files)
+            shell(
+                f"export PATH={COVERM_ENV}:$PATH && "
+                f"{COVERM} genome "
+                f"--bam-files {input.bam} "
+                f"--genome-fasta-files {bin_str} "
+                f"-t {threads} "
+                f"-m mean relative_abundance covered_fraction "
+                f"--min-covered-fraction 0 "
+                f"-o {output.tsv}"
+            )
+
+# ── Barrnap — 16S rRNA extraction (dual-kingdom: bac + arc) ──────────────────
+rule barrnap_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        gff   = f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_rrna.gff",
+        fa16s = f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_16S.fa"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        export PATH={BARRNAP_ENV}:$PATH
+
+        OUTDIR="{BARRNAP_DIR}/{wildcards.sample}/{wildcards.mag}"
+        mkdir -p "$OUTDIR"
+
+        _outseq_bac="$OUTDIR/{wildcards.mag}_rrna_bac.fa"
+        _outseq_arc="$OUTDIR/{wildcards.mag}_rrna_arc.fa"
+        _gff_bac="$OUTDIR/{wildcards.mag}_rrna_bac.gff"
+        _gff_arc="$OUTDIR/{wildcards.mag}_rrna_arc.gff"
+
+        {BARRNAP_BIN} \
+          --kingdom bac \
+          --threads {threads} \
+          --lencutoff 0.5 \
+          --reject 0.1 \
+          --outseq "$_outseq_bac" \
+          {input.fasta} \
+          > "$_gff_bac" 2>> /dev/stderr || true
+
+        {BARRNAP_BIN} \
+          --kingdom arc \
+          --threads {threads} \
+          --lencutoff 0.5 \
+          --reject 0.1 \
+          --outseq "$_outseq_arc" \
+          {input.fasta} \
+          > "$_gff_arc" 2>> /dev/stderr || true
+
+        [ -f "$_outseq_bac" ] || touch "$_outseq_bac"
+        [ -f "$_outseq_arc" ] || touch "$_outseq_arc"
+        [ -f "$_gff_bac"    ] || touch "$_gff_bac"
+        [ -f "$_gff_arc"    ] || touch "$_gff_arc"
+
+        {{
+          cat "$_gff_bac"
+          grep -v '^#' "$_gff_arc" || true
+        }} > {output.gff}
+
+        _outseq_all="$OUTDIR/{wildcards.mag}_rrna_all.fa"
+        cat "$_outseq_bac" "$_outseq_arc" > "$_outseq_all"
+
+        _out16s="{output.fa16s}"
+        _mag="{wildcards.mag}"
+        python3 - "$_outseq_all" "$_out16s" "$_mag" <<'PYEOF'
+import sys, re
+
+rrna_fa, out16s, mag = sys.argv[1], sys.argv[2], sys.argv[3]
+
+IS_16S_RE = re.compile(r'16[Ss][_\s]?[rR]RNA|16[Ss]\s+ribosomal', re.IGNORECASE)
+
+seqs = []
+in_16s = False
+seq_id = ""
+seq_buf = []
+
+try:
+    with open(rrna_fa) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if in_16s and seq_buf:
+                    seqs.append((seq_id, "".join(seq_buf)))
+                seq_id = line
+                in_16s = bool(IS_16S_RE.search(line))
+                seq_buf = []
+            else:
+                if in_16s:
+                    seq_buf.append(line)
+        if in_16s and seq_buf:
+            seqs.append((seq_id, "".join(seq_buf)))
+except FileNotFoundError:
+    pass
+
+with open(out16s, "w") as out:
+    if seqs:
+        for i, (sid, seq) in enumerate(seqs, 1):
+            contig = sid.lstrip(">").split()[0]
+            length = len(seq)
+            flag = "_partial" if length < 1200 else ""
+            new_header = ">" + mag + "_" + contig + "_16S_" + str(i) + flag + " len=" + str(length)
+            out.write(new_header + "\n" + seq + "\n")
+        print("[barrnap] " + mag + ": " + str(len(seqs)) + " 16S sequence(s) written to " + out16s)
+    else:
+        out.write("# No 16S rRNA gene detected in " + mag + "\n")
+        print("[barrnap] " + mag + ": No 16S rRNA detected")
+PYEOF
+        """
+
+rule barrnap_all:
+    input:
+        lambda wildcards: expand(
+            f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_16S.fa",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        combined = f"{BARRNAP_DIR}/{{sample}}/all_MAGs_16S_rRNA.fa",
+        summary  = f"{BARRNAP_DIR}/{{sample}}/16S_detection_summary.tsv",
+        done     = f"{BARRNAP_DIR}/{{sample}}/barrnap.done"
+    run:
+        import os, re, glob as _glob
+
+        total = with_full = with_partial = no_16s = 0
+        summary_rows = ["MAG\tStatus\tNum_16S\tNotes"]
+
+        with open(output.combined, "w") as out_fh:
+            for fa_path in sorted(input):
+                mag_name = os.path.basename(os.path.dirname(fa_path))
+                total += 1
+                seq_count = partial_count = 0
+                no_detect = False
+
+                with open(fa_path) as in_fh:
+                    for line in in_fh:
+                        if line.startswith("#"):
+                            no_detect = True
+                        elif line.startswith(">"):
+                            seq_count += 1
+                            if "_partial" in line:
+                                partial_count += 1
+                            out_fh.write(line)
+                        else:
+                            if not no_detect:
+                                out_fh.write(line)
+
+                if no_detect or seq_count == 0:
+                    no_16s += 1
+                    summary_rows.append(f"{mag_name}\tNone\t0\tNo 16S detected")
+                elif partial_count == seq_count:
+                    with_partial += 1
+                    summary_rows.append(f"{mag_name}\tPartial\t{seq_count}\t{partial_count} partial <1200 bp")
+                else:
+                    with_full += 1
+                    summary_rows.append(f"{mag_name}\tFull\t{seq_count}\t{partial_count} partial, {seq_count-partial_count} full")
+
+        with open(output.summary, "w") as sfh:
+            sfh.write("\n".join(summary_rows) + "\n")
+            sfh.write(f"\n# TOTAL MAGs: {total}\n# Full: {with_full}\n# Partial: {with_partial}\n# None: {no_16s}\n")
+        open(output.done, "w").close()
+
+# ── Prokka — structural & functional gene annotation ─────────────────────────
+rule prokka:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        gff = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff",
+        faa = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa",
+        ffn = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.ffn"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {PROKKA_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={PROKKA_ENV}:$PATH
+        {PROKKA} \
+          --outdir {PROKKA_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --prefix {wildcards.mag} \
+          --metagenome \
+          --kingdom Bacteria \
+          --cpus {threads} \
+          --force \
+          --compliant \
+          {input.fasta}
+        """
+
+rule prokka_all:
+    input:
+        lambda wildcards: expand(
+            f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{PROKKA_DIR}/{{sample}}/prokka.done"
+    shell:
+        "mkdir -p {PROKKA_DIR}/{wildcards.sample}; touch {output.done}"
+
+# ── CCTyper per MAG ───────────────────────────────────────────────────────────
+rule cctyper_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        done = f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{CCTYPER_DIR}/{wildcards.sample}/{wildcards.mag}"
+        if [ -d "$OUTDIR" ]; then rm -rf "$OUTDIR"; fi
+        mkdir -p "$(dirname "$OUTDIR")"
+        export PATH={CCTYPER_ENV}:$PATH
+        echo "[CCTyper] Running on {wildcards.mag}" >&2
+        {CCTYPER_BIN} \
+          {input.fasta} \
+          "$OUTDIR" \
+          --db "{CCTYPER_DB}" \
+          -t {threads} \
+          2>&1
+        mkdir -p "$OUTDIR"
+        touch {output.done}
+        """
+
+rule cctyper_all:
+    input:
+        lambda wildcards: expand(
+            f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{CCTYPER_DIR}/{{sample}}/cctyper.done"
+    shell:
+        "touch {output.done}"
+
+# ── dbCAN per MAG ─────────────────────────────────────────────────────────────
+rule dbcan_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        done = f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {DBCAN_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={DBCAN_ENV}:$PATH
+        {DBCAN_BIN} \
+          {input.fasta} \
+          meta \
+          --db_dir {DBCAN_DB} \
+          --out_dir {DBCAN_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --cgc_substrate \
+          --tf_cpu {threads} \
+          --dia_cpu {threads} \
+          --hmm_cpu {threads}
+        touch {output.done}
+        """
+
+rule dbcan_all:
+    input:
+        lambda wildcards: expand(
+            f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{DBCAN_DIR}/{{sample}}/dbcan.done"
+    shell:
+        "touch {output.done}"
+
+# ── ABRicate — AMR/virulence genes per MAG × DB ───────────────────────────────
+rule abricate:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        tsv = f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {ABRICATE_DIR}/{wildcards.sample}/{wildcards.db}
+        export PATH={ABRICATE_ENV}:$PATH
+        {ABRICATE} \
+          --db {wildcards.db} \
+          --minid 80 \
+          --mincov 70 \
+          {input.fasta} \
+          > {output.tsv}
+        """
+
+rule abricate_summary:
+    input:
+        lambda wildcards: expand(
+            f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv",
+            sample=wildcards.sample,
+            db=wildcards.db,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        summary = f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={ABRICATE_ENV}:$PATH
+        {ABRICATE} --summary {ABRICATE_DIR}/{wildcards.sample}/{wildcards.db}/*.tsv \
+          > {output.summary}
+        """
+
+rule abricate_all:
+    input:
+        lambda wildcards: expand(
+            f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv",
+            sample=wildcards.sample,
+            db=ABRICATE_DBS
+        )
+    output:
+        done = f"{ABRICATE_DIR}/{{sample}}/abricate.done"
+    shell:
+        "mkdir -p {ABRICATE_DIR}/{wildcards.sample}; touch {output.done}"
+
+rule virsorter2:
+    input:
+        contigs = assembly_fasta
+    output:
+        done = f"{VIRAL_DIR}/{{sample}}/virsorter2.done"
+    threads: 16
+    shell:
+        r"""
+        set -euo pipefail
+        workdir="{VIRAL_DIR}/{wildcards.sample}/virsorter2"
+        rm -rf "$workdir"
+        mkdir -p "$workdir"
+        export PATH={VIRSORTER2_ENV}:$PATH
+        {VIRSORTER2} run \
+          -i {input.contigs} \
+          -w "$workdir" \
+          -j {threads} \
+          --db-dir {VIRSORTER2_DB} \
+          --min-length {VIRSORTER_MIN_LENGTH} \
+          --min-score {VIRSORTER_MIN_SCORE} \
+          all
+        touch {output.done}
+        """
+
+# ── HADEG — hydrocarbon degradation gene catalogue ────────────────────────────
+rule hadeg_proteinortho:
+    input:
+        hadeg_db    = HADEG_DB,
+        prokka_done = f"{PROKKA_DIR}/{{sample}}/prokka.done",
+        mags        = lambda wc: expand(
+            f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa",
+            sample=wc.sample,
+            mag=get_filtered_mags(wc)
+        )
+    output:
+        tsv  = f"{HADEG_OUTDIR}/{{sample}}/Results_HADEG.proteinortho.tsv",
+        done = f"{HADEG_OUTDIR}/{{sample}}/hadeg_proteinortho.done"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {HADEG_OUTDIR}/{wildcards.sample}
+
+        HADEG_DB_ABS="{input.hadeg_db}"
+        if [ ! -f "$HADEG_DB_ABS" ]; then
+            echo "[HADEG] ERROR: database not found at $HADEG_DB_ABS" >&2
+            exit 1
+        fi
+
+        # Sanitize Prokka FAA files: strip stop-codon '*' (proteinortho >=6.3 rejects them)
+        CLEAN_DIR="{HADEG_OUTDIR}/{wildcards.sample}/clean_faa"
+        mkdir -p "$CLEAN_DIR"
+        clean_mags=""
+        for f in {input.mags}; do
+            case "$f" in
+                /*) abs_f="$f" ;;
+                *)  abs_f="$(pwd)/$f" ;;
+            esac
+            base=$(basename "$f")
+            clean_f="$CLEAN_DIR/$base"
+            sed -E '/^>/! s/[^XOUBZACDEFGHIKLMNPQRSTVWYxoubzacdefghiklmnpqrstvwy]//g; /^$/d' \
+                "$abs_f" > "$clean_f"
+            clean_mags="$clean_mags $clean_f"
+        done
+        echo "[HADEG] Sanitized $(echo $clean_mags | wc -w) MAG FAA files → $CLEAN_DIR" >&2
+
+        # Also sanitize the HADEG database FAA
+        CLEAN_DB="$CLEAN_DIR/$(basename {input.hadeg_db})"
+        sed -E '/^>/! s/[^XOUBZACDEFGHIKLMNPQRSTVWYxoubzacdefghiklmnpqrstvwy]//g; /^$/d' \
+            "$HADEG_DB_ABS" > "$CLEAN_DB"
+
+        mag_count=$(echo $clean_mags | wc -w)
+        echo "[HADEG] Running proteinortho with $mag_count MAG FAA file(s)" >&2
+        if [ "$mag_count" -eq 0 ]; then
+            echo "[HADEG] WARNING: No filtered MAG FAA files found. Writing empty TSV and skipping proteinortho." >&2
+            printf "# Species\tGenes\tAlg.-Conn.\t$(basename {input.hadeg_db})\n" \
+                > "{output.tsv}"
+            touch "{output.done}"
+            exit 0
+        fi
+
+        # Run proteinortho from the output directory
+        cd {HADEG_OUTDIR}/{wildcards.sample}
+        PROTEINORTHO_BIN="{PROTEINORTHO}"
+        DIAMOND_BIN="{HADEG_DIAMOND}"
+        if [ "$PROTEINORTHO_BIN" != "$(basename "$PROTEINORTHO_BIN")" ]; then
+            export PATH="$(dirname "$PROTEINORTHO_BIN"):$PATH"
+        fi
+        if [ "$DIAMOND_BIN" != "$(basename "$DIAMOND_BIN")" ]; then
+            export PATH="$(dirname "$DIAMOND_BIN"):$PATH"
+        fi
+        if ! command -v diamond >/dev/null 2>&1; then
+            echo "[HADEG] ERROR: DIAMOND not found for Proteinortho HADEG run." >&2
+            exit 1
+        fi
+        "{HADEG_PYTHON}" "{HADEG_RUNNER}" \
+          --proteinortho "$PROTEINORTHO_BIN" \
+          --diamond "$DIAMOND_BIN" \
+          --workdir "$PWD" \
+          --project Results_HADEG \
+          --threads {threads} \
+          --stall-seconds {HADEG_STALL_SECONDS} \
+          --max-attempts {HADEG_MAX_ATTEMPTS} \
+          "$CLEAN_DB" $clean_mags
+
+        RESULT_TSV="{HADEG_OUTDIR}/{wildcards.sample}/Results_HADEG.proteinortho.tsv"
+        if [ ! -s "$RESULT_TSV" ]; then
+            echo "[HADEG] ERROR: $RESULT_TSV is empty or missing" >&2
+            exit 1
+        fi
+        touch "{output.done}"
+        """
+
+# ── BUSCO on filtered MAGs — scatter/gather ───────────────────────────────────
+rule busco_filtered_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa",
+        done  = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    output:
+        done = f"{BUSCO_FILTERED_DIR}/{{sample}}/{{mag}}/busco_filtered.done"
+    threads: MAG_THREADS
+    params:
+        lineage = BUSCO_LINEAGE
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{BUSCO_FILTERED_DIR}/{wildcards.sample}"
+        mkdir -p "$OUTDIR"
+        export PATH={BUSCO_ENV}:$PATH
+        echo "[BUSCO-filtered] Processing {wildcards.mag}"
+        {BUSCO_BIN} \
+          -i {input.fasta} \
+          -o {wildcards.mag} \
+          --out_path "$OUTDIR" \
+          -m genome \
+          -l {params.lineage} \
+          --offline \
+          -c {threads} \
+          --force 2>&1
+        touch {output.done}
+        """
+
+rule busco_filtered_all:
+    """Gather all per-MAG BUSCO-on-filtered results; write summary TSV."""
+    input:
+        lambda wildcards: expand(
+            f"{BUSCO_FILTERED_DIR}/{{sample}}/{{mag}}/busco_filtered.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        summary = f"{BUSCO_FILTERED_DIR}/{{sample}}/busco_filtered_summary.tsv",
+        done    = f"{BUSCO_FILTERED_DIR}/{{sample}}/busco_filtered_all.done"
+    run:
+        import os, re, glob as _glob
+
+        rows = ["MAG\tbusco_complete_pct\tbusco_single_pct\tbusco_duplicated_pct\tbusco_fragmented_pct\tbusco_missing_pct\tn_markers"]
+        busco_dir = f"{BUSCO_FILTERED_DIR}/{wildcards.sample}"
+
+        for summary_file in sorted(_glob.glob(
+            os.path.join(busco_dir, "**", "short_summary*.txt"), recursive=True
+        )):
+            mag = os.path.basename(os.path.dirname(summary_file))
+            with open(summary_file) as fh:
+                content = fh.read()
+
+            vals = {"C": None, "S": None, "D": None, "F": None, "M": None, "n": None}
+            compact = re.search(
+                r"C:([\d.]+)%\[S:([\d.]+)%,D:([\d.]+)%\],F:([\d.]+)%,M:([\d.]+)%,n:(\d+)",
+                content,
+            )
+            if compact:
+                vals = dict(zip(("C", "S", "D", "F", "M", "n"), compact.groups()))
+
+            rows.append(
+                f"{mag}\t{vals['C']}\t{vals['S']}\t{vals['D']}\t{vals['F']}\t{vals['M']}\t{vals['n']}"
+            )
+
+        os.makedirs(os.path.dirname(output.summary), exist_ok=True)
+        with open(output.summary, "w") as fh:
+            fh.write("\n".join(rows) + "\n")
+        print(f"[busco_filtered_all] Written {len(rows)-1} MAG entries → {output.summary}")
+        open(output.done, "w").close()
+
+
+# =============================================================================
+# PHASE 6 — GENE CATALOGUE ANALYSIS
+# =============================================================================
+
+# =============================================================================
+# RULE: prodigal_assembly  — FIX: use prokka env, not prodigal_env
+# =============================================================================
+rule prodigal_assembly:
+    input:
+        contigs = assembly_fasta
+    output:
+        ffn = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.ffn",
+        faa = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.faa",
+        gff = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.gff"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {PRODIGAL_DIR}/{wildcards.sample}
+
+        # FIX: prodigal lives in prokka env, not a separate prodigal_env
+        export PATH={PROKKA_ENV}:$PATH
+
+        _contigs="{input.contigs}"
+        _out_fa="{PRODIGAL_DIR}/{wildcards.sample}/contigs_min500.fa"
+
+        cat > /tmp/prodigal_filter_$$.py << 'SCRIPTEOF'
+import sys
+in_fa, out_path = sys.argv[1], sys.argv[2]
+out = []
+hdr = None
+seq_buf = []
+with open(in_fa) as fh:
+    for line in fh:
+        line = line.rstrip()
+        if line.startswith(">"):
+            if hdr and len("".join(seq_buf)) >= 500:
+                out.append(hdr)
+                out.extend(seq_buf)
+            hdr = line
+            seq_buf = []
+        else:
+            seq_buf.append(line)
+    if hdr and len("".join(seq_buf)) >= 500:
+        out.append(hdr)
+        out.extend(seq_buf)
+with open(out_path, "w") as fh:
+    fh.write("\n".join(out) + "\n")
+kept = len([x for x in out if x.startswith(">")])
+print("[prodigal_assembly] Kept " + str(kept) + " contigs >=500 bp")
+if kept == 0:
+    print("[prodigal_assembly] WARNING: no contigs >=500 bp")
+SCRIPTEOF
+        python3 /tmp/prodigal_filter_$$.py "$_contigs" "$_out_fa"
+        rm -f /tmp/prodigal_filter_$$.py
+
+        prodigal \
+          -i "$_out_fa" \
+          -a {output.faa} \
+          -d {output.ffn} \
+          -f gff \
+          -o {output.gff} \
+          -p meta
+        """
+
+
+rule cdhit_proteins:
+    """Cluster predicted proteins at 95% identity to build non-redundant catalogue."""
+    input:
+        faa = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.faa"
+    output:
+        nr   = f"{CDHIT_DIR}/{{sample}}/gene_catalogue_nr.faa",
+        clst = f"{CDHIT_DIR}/{{sample}}/gene_catalogue_nr.faa.clstr"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {CDHIT_DIR}/{wildcards.sample}
+        {CDHIT_AA} \
+          -i {input.faa} \
+          -o {output.nr} \
+          -c 0.95 \
+          -aS 0.90 \
+          -n 5 \
+          -T {threads} \
+          -M 0 \
+          -d 0
+        """
+
+rule bowtie2_gene_map:
+    """Map short reads to Prodigal gene sequences for quantification."""
+    input:
+        r1  = f"{SR_HOST_DIR}/{{sample}}/R1_decontam.fastq",
+        r2  = f"{SR_HOST_DIR}/{{sample}}/R2_decontam.fastq",
+        ffn = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.ffn"
+    output:
+        bam = f"{QUANT_DIR}/{{sample}}/genes_mapped.sorted.bam"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {QUANT_DIR}/{wildcards.sample}
+        {BOWTIE2_BUILD} \
+          --threads {threads} \
+          {input.ffn} \
+          {QUANT_DIR}/{wildcards.sample}/genes_index
+        {BOWTIE2} \
+          -x {QUANT_DIR}/{wildcards.sample}/genes_index \
+          -1 {input.r1} \
+          -2 {input.r2} \
+          -p {threads} \
+          --no-unal \
+        | {SAMTOOLS} sort -@ {threads} -o {output.bam}
+        {SAMTOOLS} index {output.bam}
+        """
+
+rule featurecounts_gene_quant:
+    """Count short reads per gene using featureCounts (paired-end mode)."""
+    input:
+        bam = f"{QUANT_DIR}/{{sample}}/genes_mapped.sorted.bam",
+        gff = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.gff"
+    output:
+        counts = f"{QUANT_DIR}/{{sample}}/gene_counts.txt"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        export PATH={CDHIT_ENV}:$PATH
+        {FEATURECOUNTS} \
+          -a {input.gff} \
+          -F GFF \
+          -t CDS \
+          -g ID \
+          -p \
+          -B \
+          -T {threads} \
+          -o {output.counts} \
+          {input.bam}
+        """
+
+
+# =============================================================================
+# PHASE 7 — AGGREGATED REPORTING
+# =============================================================================
+
+rule multiqc_collect:
+    input:
+        fastp      = f"{FASTP_DIR}/{SAMPLE}/fastp.json",
+        nanostat_raw      = f"{NANOSTAT_DIR}/{SAMPLE}/raw_nanostat.txt",
+        nanoq             = f"{NANOQ_DIR}/{SAMPLE}/nanoq_summary.txt",
+        nanostat_filtered = f"{NANOSTAT_DIR}/{SAMPLE}/filtered_nanostat.txt",
+        quast      = f"{QUAST_DIR}/{SAMPLE}/report.html",
+        bam        = f"{MAP_DIR}/{SAMPLE}.sorted.bam",
+        checkm2    = f"{CHECKM_DIR}/{SAMPLE}/quality_report.tsv",
+        busco      = f"{BUSCO_DIR}/{SAMPLE}/busco.done",
+        merged_qc  = f"{MERGED_QC}/{SAMPLE}/combined_quality_summary.tsv",
+        late       = lambda wildcards: [
+            f"{GTDB_DIR}/{SAMPLE}/gtdbtk.bac120.summary.tsv",
+            f"{GTDB_DIR}/{SAMPLE}/gtdbtk.ar53.summary.tsv",
+            f"{DREP_DIR}/{SAMPLE}/dereplicated_genomes",
+            f"{COVERM_DIR}/{SAMPLE}/coverage.tsv",
+            f"{BARRNAP_DIR}/{SAMPLE}/barrnap.done",
+            f"{QUANT_DIR}/{SAMPLE}/gene_counts.txt",
+        ] + ([f"{PROKKA_DIR}/{SAMPLE}/prokka.done"] if RUN_PROKKA_CHAIN else []) \
+          + ([f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done"] if RUN_CCTYPER else []) \
+          + ([f"{DBCAN_DIR}/{SAMPLE}/dbcan.done"] if RUN_DBCAN else []) \
+          + ([f"{ABRICATE_DIR}/{SAMPLE}/abricate.done"] if RUN_ABRICATE else []) \
+          + ([f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done"] if RUN_VIRSORTER2 else []) \
+          + ([f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv"] if RUN_KRAKEN else []) \
+          + ([f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done"] if RUN_HADEG else []) \
+          + ([f"{BUSCO_FILTERED_DIR}/{SAMPLE}/busco_filtered_all.done"] if RUN_BUSCO_FILTERED else []),
+    output:
+        sentinel = f"{MULTIQC_DIR}/{SAMPLE}_collect.done"
+    run:
+        import os
+        os.makedirs(MULTIQC_DIR, exist_ok=True)
+        optional = [
+            f"{GTDB_DIR}/{SAMPLE}/gtdbtk.bac120.summary.tsv",
+            f"{GTDB_DIR}/{SAMPLE}/gtdbtk.ar53.summary.tsv",
+            f"{DREP_DIR}/{SAMPLE}/dereplicated_genomes",
+            f"{COVERM_DIR}/{SAMPLE}/coverage.tsv",
+            f"{BARRNAP_DIR}/{SAMPLE}/16S_detection_summary.tsv",
+            f"{BARRNAP_DIR}/{SAMPLE}/barrnap.done",
+            f"{PROKKA_DIR}/{SAMPLE}/prokka.done",
+            f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done",
+            f"{DBCAN_DIR}/{SAMPLE}/dbcan.done",
+            f"{ABRICATE_DIR}/{SAMPLE}/abricate.done",
+            f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done",
+            f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv",
+            f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done",
+            f"{BUSCO_FILTERED_DIR}/{SAMPLE}/busco_filtered_all.done",
+            f"{QUANT_DIR}/{SAMPLE}/gene_counts.txt",
+        ]
+        missing = [path for path in optional if not os.path.exists(path)]
+        present = [path for path in optional if os.path.exists(path)]
+        with open(output.sentinel, "w") as fh:
+            fh.write(f"[multiqc_collect] Sample: {SAMPLE}\n")
+            fh.write("Core inputs:     OK\n")
+            fh.write(f"Optional present ({len(present)}/{len(optional)}):\n")
+            for path in present:
+                fh.write(f"  OK  {path}\n")
+            if missing:
+                fh.write(f"Optional missing/failed ({len(missing)}):\n")
+                for path in missing:
+                    fh.write(f"  --  {path}\n")
+                print(
+                    f"[multiqc_collect] WARNING: {len(missing)} optional output(s) not found.",
+                    flush=True,
+                )
+
+rule multiqc:
+    input:
+        sentinel = f"{MULTIQC_DIR}/{SAMPLE}_collect.done"
+    output:
+        report = f"{MULTIQC_DIR}/multiqc_report.html"
+    shell:
+        """
+        mkdir -p {MULTIQC_DIR}
+        {MULTIQC} {OUTPUT_ROOT} -o {MULTIQC_DIR} --force
+        """

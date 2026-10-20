@@ -1,0 +1,360 @@
+name: ${COMPOSE_PROJECT_NAME:-genocular}
+
+x-common-env: &common-env
+  TZ: ${TZ:-Asia/Kolkata}
+  TENANT_ID: ${TENANT_ID:-cbb}
+  RAW_BUCKET: ${RAW_BUCKET:-raw}
+  RESULTS_BUCKET: ${RESULTS_BUCKET:-results}
+  LOGS_BUCKET: ${LOGS_BUCKET:-logs}
+  REFS_BUCKET: ${REFS_BUCKET:-refs}
+  DEMO_RESULTS_BUCKET: ${DEMO_RESULTS_BUCKET:-demo-results}
+
+services:
+  nginx:
+    image: nginx:1.30.6-alpine
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    ports:
+      - "${GENOCULAR_BIND_ADDRESS:-0.0.0.0}:${GENOCULAR_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-genocular}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-genocular}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  db-init:
+    build: ./api
+    command:
+      - python
+      - -c
+      - from db import engine; from models import Base; Base.metadata.create_all(bind=engine)
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-genocular}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-genocular}
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    build:
+      context: ./infra/minio
+      args:
+        MINIO_VERSION: ${MINIO_VERSION:-RELEASE.2025-10-15T17-29-55Z}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-genocular}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS is required}
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_CONSOLE_URL:?MINIO_CONSOLE_URL is required}
+    ports:
+      - "${GENOCULAR_BIND_ADDRESS:-0.0.0.0}:${GENOCULAR_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  minio-setup:
+    build:
+      context: ./infra/mc
+      args:
+        MC_VERSION: ${MC_VERSION:-RELEASE.2025-04-16T18-13-26Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        set -eu
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do sleep 2; done
+        mc mb --ignore-existing "local/$$RAW_BUCKET"
+        mc mb --ignore-existing "local/$$RESULTS_BUCKET"
+        mc mb --ignore-existing "local/$$LOGS_BUCKET"
+        mc mb --ignore-existing "local/$$REFS_BUCKET"
+        mc mb --ignore-existing "local/$$DEMO_RESULTS_BUCKET"
+        mc mirror --overwrite /demo-fixtures "local/$$DEMO_RESULTS_BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-genocular}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      RAW_BUCKET: ${RAW_BUCKET:-raw}
+      RESULTS_BUCKET: ${RESULTS_BUCKET:-results}
+      LOGS_BUCKET: ${LOGS_BUCKET:-logs}
+      REFS_BUCKET: ${REFS_BUCKET:-refs}
+      DEMO_RESULTS_BUCKET: ${DEMO_RESULTS_BUCKET:-demo-results}
+    volumes:
+      - ./demo/fixtures:/demo-fixtures:ro
+    restart: "no"
+
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 10s
+      start_period: 20s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    user: "${JOB_UID:-1000}:${JOB_GID:-1000}"
+    environment:
+      <<: *common-env
+      PYTHONDONTWRITEBYTECODE: "1"
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-genocular}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-genocular}
+      REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE: ${RQ_QUEUE:-genocular}
+      RUNNER_WEBHOOK_TOKEN: ${API_SECRET:?API_SECRET is required}
+      API_SECRET: ${API_SECRET}
+      JOB_TOKEN_PEPPER: ${JOB_TOKEN_PEPPER:?JOB_TOKEN_PEPPER is required}
+      FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:?VITE_FIREBASE_PROJECT_ID is required}
+      FRONTEND_URL: ${FRONTEND_URL:?FRONTEND_URL is required}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ENDPOINT_INTERNAL: minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:?MINIO_PUBLIC_ENDPOINT is required}
+      MINIO_ENDPOINT_EXTERNAL: ${MINIO_PUBLIC_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-genocular}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_USE_SSL: "false"
+      MINIO_RESULTS_BUCKET: ${RESULTS_BUCKET:-results}
+      STORAGE_CLEANUP_MANAGED_BY_WORKER: "1"
+      QUEUE_DIR: /jobq/jobs
+      WGS_JOB_TIMEOUT_SECONDS: ${WGS_JOB_TIMEOUT_SECONDS:-86400}
+      METAGENOMICS_JOB_TIMEOUT_SECONDS: ${METAGENOMICS_JOB_TIMEOUT_SECONDS:-172800}
+      UPLOAD_SESSION_TTL_SECONDS: ${UPLOAD_SESSION_TTL_SECONDS:-604800}
+      MAX_UPLOAD_FILE_BYTES: ${MAX_UPLOAD_FILE_BYTES:-107374182400}
+      MAX_UPLOAD_FILES_PER_JOB: ${MAX_UPLOAD_FILES_PER_JOB:-3}
+      ANONYMOUS_JOB_INIT_LIMIT_PER_HOUR: ${ANONYMOUS_JOB_INIT_LIMIT_PER_HOUR:-20}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_FROM: "${SMTP_FROM:-GENOCULAR <noreply@localhost>}"
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      ASSISTANT_RAG_ONLY: ${ASSISTANT_RAG_ONLY:-0}
+      ASSISTANT_LLM_TIMEOUT_SECONDS: ${ASSISTANT_LLM_TIMEOUT_SECONDS:-60}
+      ANALYSIS_ASSISTANT_MODEL: ${ANALYSIS_ASSISTANT_MODEL:-gemma4:12b}
+      ANALYSIS_ASSISTANT_TIMEOUT_SECONDS: ${ANALYSIS_ASSISTANT_TIMEOUT_SECONDS:-300}
+      SCIENTIFIC_DOCS_PATH: /app/scientific_interpretation_docs.json
+      SYSTEM_STORAGE_PATHS: server:/app,workflow_data:/data/genoverse
+    volumes:
+      - ${GENOCULAR_DATA_ROOT:-./data/genocular}:/data/genoverse:ro
+      - ${GENOCULAR_DB_ROOT:-./data/databases}:/data/dbs:ro
+      - ${GENOCULAR_SCRATCH_ROOT:-./data/scratch}:/scratch:ro
+      - ${GENOCULAR_JOBQ_ROOT:-./data/genocular/jobq}:/jobq
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=128m"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 20
+    restart: unless-stopped
+
+  cleanup:
+    build: ./api
+    user: "${JOB_UID:-1000}:${JOB_GID:-1000}"
+    command: ["python", "cleanup_worker.py"]
+    environment:
+      <<: *common-env
+      PYTHONDONTWRITEBYTECODE: "1"
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-genocular}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-genocular}
+      REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE: ${RQ_QUEUE:-genocular}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-genocular}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      STORAGE_RETENTION_DAYS: ${STORAGE_RETENTION_DAYS:-7}
+      RESULT_STORAGE_RETENTION_DAYS: ${RESULT_STORAGE_RETENTION_DAYS:-7}
+      LOG_STORAGE_RETENTION_DAYS: ${LOG_STORAGE_RETENTION_DAYS:-7}
+      RAW_STORAGE_RETENTION_DAYS: ${RAW_STORAGE_RETENTION_DAYS:-0}
+      LOCAL_STORAGE_RETENTION_DAYS: ${LOCAL_STORAGE_RETENTION_DAYS:-0}
+      FAILED_STORAGE_RETENTION_DAYS: ${FAILED_STORAGE_RETENTION_DAYS:-1}
+      ABANDONED_JOB_RETENTION_DAYS: ${ABANDONED_JOB_RETENTION_DAYS:-2}
+      ORPHAN_LOCAL_RETENTION_DAYS: ${ORPHAN_LOCAL_RETENTION_DAYS:-7}
+      MULTIPART_RETENTION_DAYS: ${MULTIPART_RETENTION_DAYS:-7}
+      CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS:-21600}
+      JOB_WORK_ROOT: /data/genoverse/jobs
+      SCRATCH_ROOT: /scratch
+    volumes:
+      - ${GENOCULAR_DATA_ROOT:-./data/genocular}:/data/genoverse
+      - ${GENOCULAR_SCRATCH_ROOT:-./data/scratch}:/scratch
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: ./runner
+      args:
+        JOB_UID: ${JOB_UID:-1000}
+        JOB_GID: ${JOB_GID:-1000}
+    user: "${JOB_UID:-1000}:${JOB_GID:-1000}"
+    init: true
+    environment:
+      <<: *common-env
+      PYTHONDONTWRITEBYTECODE: "1"
+      REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE: ${RQ_QUEUE:-genocular}
+      RUNNER_WEBHOOK_TOKEN: ${API_SECRET}
+      API_INTERNAL_URL: http://api:8000
+      TMPDIR: /data/genoverse/tmp
+      TEMP: /data/genoverse/tmp
+      TMP: /data/genoverse/tmp
+      PIP_CACHE_DIR: /data/genoverse/tmp/pip_cache
+      CONDA_PKGS_DIRS: /data/genoverse/conda_pkgs
+      CONDA_ENVS_PATH: /data/genoverse/smk_envs_v4/shared
+      SHARED_CONDA_PREFIX: /data/genoverse/smk_envs_v4/shared
+      GENOVERSE_PROFILE_ENVS_ROOT: /data/genoverse/smk_envs_profiles
+      APPTAINER_CACHEDIR: /data/tmp/apptainer_cache
+      APPTAINER_TMPDIR: /data/tmp/apptainer_tmp
+      SNAKEMAKE_CORES: ${SNAKEMAKE_CORES:-8}
+      SNAKEMAKE_GPUS: ${SNAKEMAKE_GPUS:-1}
+      SNAKEMAKE_LATENCY: ${SNAKEMAKE_LATENCY:-180}
+      SCRATCH_DIR: /scratch
+      WORK_ROOT: /scratch
+      PIPELINE_BASE: /data/genoverse
+      STATUS_WRITER: /app/status_writer.py
+      FILTLONG_BIN: /dbs/Filtlong/bin/filtlong
+      SEMIBIN_ENGINE: ${SEMIBIN_ENGINE:-cpu}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-genocular}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_RESULTS_BUCKET: ${RESULTS_BUCKET:-results}
+      FRONTEND_URL: ${FRONTEND_URL}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_FROM: "${SMTP_FROM:-GENOCULAR <noreply@localhost>}"
+      OLLAMA_URL: http://ollama:11434
+      FAILURE_EMAIL_MODEL: ${FAILURE_EMAIL_MODEL:-gemma4:12b}
+      FAILURE_EMAIL_AI_ENABLED: ${FAILURE_EMAIL_AI_ENABLED:-0}
+      FAILURE_EMAIL_AI_TIMEOUT_SECONDS: ${FAILURE_EMAIL_AI_TIMEOUT_SECONDS:-300}
+      HOME: /data/genoverse/home_runner
+      XDG_CACHE_HOME: /data/genoverse/home_runner/.cache
+      XDG_CONFIG_HOME: /data/genoverse/home_runner/.config
+      XDG_DATA_HOME: /data/genoverse/home_runner/.local/share
+    volumes:
+      - ${GENOCULAR_DATA_ROOT:-./data/genocular}:/data/genoverse
+      - ${GENOCULAR_TMP_ROOT:-./data/tmp}:/data/tmp
+      - ${GENOCULAR_SCRATCH_ROOT:-./data/scratch}:/scratch
+      - ${GENOCULAR_DB_ROOT:-./data/databases}:/dbs:ro
+      - ${GENOCULAR_JOBQ_ROOT:-./data/genocular/jobq}:/jobq
+      - ./workflow:/project/workflow:ro
+      - ./plot_generators:/project/plot_generators:ro
+      - ./runner:/project/runner:ro
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE: /api
+        VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:?VITE_FIREBASE_API_KEY is required}
+        VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:?VITE_FIREBASE_AUTH_DOMAIN is required}
+        VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:?VITE_FIREBASE_PROJECT_ID is required}
+        VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:?VITE_FIREBASE_APP_ID is required}
+        VITE_FIREBASE_MESSAGING_SENDER_ID: ${VITE_FIREBASE_MESSAGING_SENDER_ID:-}
+        VITE_FIREBASE_MEASUREMENT_ID: ${VITE_FIREBASE_MEASUREMENT_ID:-}
+        VITE_ADMIN_EMAIL: ${VITE_ADMIN_EMAIL:-}
+    user: node
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+  ollama_data:

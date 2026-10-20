@@ -1,0 +1,587 @@
+{
+  "version": "2026-08-19.1",
+  "documents": [
+    {
+      "id": "short_read_qc",
+      "title": "Short-read quality control and filtering",
+      "profiles": ["all"],
+      "renderers": ["fastp_qc", "fastp_quality", "fastp_content", "fastp_rates", "fastp_retained"],
+      "tools": ["fastp", "FastQC", "MultiQC"],
+      "keywords": ["Q20", "Q30", "adapter", "duplication", "GC", "retained reads", "base quality"],
+      "typical_outputs": ["fastp JSON/HTML", "FastQC reports", "MultiQC report"],
+      "metrics": [
+        {"name": "Q20/Q30 rate", "meaning": "Fraction of bases whose reported Phred quality is at least the named threshold; it summarizes base-call confidence, not biological validity."},
+        {"name": "reads/bases retained", "meaning": "Amount retained after configured filtering and trimming. Large losses require inspection of adapters, quality, minimum length, and input quality."},
+        {"name": "GC content", "meaning": "Base-composition summary. A shift after filtering can reflect removal of contaminants or biased filtering, but is not diagnostic on its own."},
+        {"name": "duplication rate", "meaning": "Repeated read content; it can reflect PCR duplication, high coverage, low-complexity sequence, or genuinely abundant organisms."}
+      ],
+      "interpretation": [
+        "Compare before- and after-filtering counts, quality profiles, adapter content, length distribution, and GC together.",
+        "For metagenomes, unusual or multimodal GC and duplication can be biological consequences of mixed organisms, so isolate-style rules should not be applied mechanically.",
+        "MultiQC aggregates upstream reports and does not perform a new biological analysis."
+      ],
+      "caveats": [
+        "Phred scores are sequencer estimates and may be platform- or run-dependent.",
+        "Aggressive trimming can shorten reads and reduce downstream assembly continuity even when mean quality improves.",
+        "Passing QC does not establish sample identity, purity, or sufficient depth."
+      ],
+      "sources": [
+        "https://github.com/OpenGene/fastp",
+        "https://docs.seqera.io/multiqc/"
+      ]
+    },
+    {
+      "id": "long_read_qc",
+      "title": "Long-read NanoStat, NanoPlot and nanoq interpretation",
+      "profiles": ["wgs:long", "wgs:hybrid", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["nanostat_qc"],
+      "tools": ["NanoStat", "NanoPlot", "nanoq"],
+      "keywords": ["long reads", "read N50", "mean quality", "raw", "filtered", "yield", "length"],
+      "typical_outputs": ["NanoStats.txt", "NanoPlot HTML/images", "filtered FASTQ"],
+      "metrics": [
+        {"name": "read N50", "meaning": "Length such that half of sequenced bases are in reads at least that long; it measures the read-length distribution, not assembly quality."},
+        {"name": "total yield", "meaning": "Total sequenced bases. Interpret relative to target genome size or metagenome complexity and coverage requirements."},
+        {"name": "mean/median read quality", "meaning": "Summary of reported per-read quality; distributions and low-quality tails remain important."}
+      ],
+      "interpretation": [
+        "Compare NanoStat on raw input with NanoStat on nanoq output to quantify the exact yield/length cost and quality gain from filtering.",
+        "Longer reads aid repeat resolution and scaffolding, while sufficient accurate yield supports polishing and low-abundance recovery."
+      ],
+      "caveats": [
+        "Read N50 can increase merely because short reads were removed; always report retained yield alongside it.",
+        "A single average quality value can hide broad or multimodal distributions.",
+        "Long-read quality encodings and calibration depend on platform/basecaller."
+      ],
+      "sources": [
+        "https://github.com/wdecoster/NanoPlot",
+        "https://github.com/esteinig/nanoq"
+      ]
+    },
+    {
+      "id": "assembly_contiguity",
+      "title": "Genome and metagenome assembly interpretation",
+      "profiles": ["all"],
+      "renderers": ["metaquast_curve", "wgs_quality"],
+      "tools": ["QUAST", "MetaQUAST", "SPAdes", "MEGAHIT", "Flye", "Unicycler", "OPERA-MS"],
+      "keywords": ["assembly", "contigs", "N50", "L50", "largest contig", "misassembly", "genome fraction"],
+      "typical_outputs": ["FASTA assembly", "QUAST report.tsv", "MetaQUAST report"],
+      "metrics": [
+        {"name": "N50/L50", "meaning": "Length/count summaries of contiguity. Higher N50 or lower L50 does not establish correctness, completeness, or absence of collapsed repeats."},
+        {"name": "total assembly length", "meaning": "Sum of assembled bases; compare with expected genome size for isolates, but mixed metagenomes do not have one expected genome size."},
+        {"name": "number of contigs", "meaning": "Fragmentation summary that depends strongly on the minimum contig length used for reporting."},
+        {"name": "misassemblies/genome fraction", "meaning": "Reference-based quantities when an appropriate reference is supplied; reference divergence can affect both."}
+      ],
+      "interpretation": [
+        "Assess contiguity together with mapping support, depth uniformity, genome quality, taxonomy, and contamination checks.",
+        "Assemblers optimize different data types: SPAdes and MEGAHIT use short reads, Flye targets long reads, while Unicycler and OPERA-MS combine read types in hybrid workflows."
+      ],
+      "caveats": [
+        "N50 is not comparable when assemblies use different length cutoffs without checking the reporting configuration.",
+        "A very contiguous assembly can still contain chimeras, collapsed repeats, contamination, or polishing errors.",
+        "Reference-based QUAST statistics are limited by reference choice and completeness."
+      ],
+      "sources": [
+        "https://quast.sourceforge.net/docs/manual.html",
+        "https://ablab.github.io/spades/output.html",
+        "https://github.com/voutcn/megahit",
+        "https://github.com/mikolmogorov/Flye/blob/flye/docs/USAGE.md",
+        "https://github.com/rrwick/Unicycler",
+        "https://www.nature.com/articles/s41587-019-0191-2"
+      ]
+    },
+    {
+      "id": "mapping_coverage",
+      "title": "Read mapping, depth and breadth of coverage",
+      "profiles": ["all"],
+      "renderers": ["mapping_depth", "mapping_flagstat", "mapping_density"],
+      "tools": ["Bowtie2", "minimap2", "SAMtools"],
+      "keywords": ["mapping", "depth", "breadth", "coverage", "flagstat", "unmapped", "properly paired"],
+      "typical_outputs": ["sorted BAM", "depth table", "flagstat summary"],
+      "metrics": [
+        {"name": "mapping rate", "meaning": "Fraction of reads aligned under the chosen mapper and parameters; it is affected by divergence, filtering, multi-mapping, and reference composition."},
+        {"name": "depth", "meaning": "Number of aligned read bases/reads covering positions. Uneven profiles may indicate repeats, copy-number variation, contamination, assembly errors, or ecological abundance differences."},
+        {"name": "breadth", "meaning": "Fraction of sequence covered at a specified minimum depth; report the threshold because breadth changes with it."},
+        {"name": "properly paired", "meaning": "Paired reads satisfying aligner/library orientation expectations, useful for short-read assembly support."}
+      ],
+      "interpretation": [
+        "Use mapping rate, breadth, depth distribution, and pair/orientation statistics together rather than relying on mean depth.",
+        "In metagenomes, depth also reflects organism abundance and strain mixture, so non-uniformity is not automatically an assembly defect."
+      ],
+      "caveats": [
+        "Multi-mapping reads in conserved or repeated regions can inflate or redistribute coverage depending on settings.",
+        "Mean depth can conceal uncovered regions and extreme peaks.",
+        "Coverage supports but does not prove correctness or biological presence without appropriate controls."
+      ],
+      "sources": [
+        "https://bowtie-bio.sourceforge.net/bowtie2/manual.shtml",
+        "https://github.com/lh3/minimap2",
+        "https://www.htslib.org/doc/samtools-depth.html"
+      ]
+    },
+    {
+      "id": "mag_binning",
+      "title": "Metagenome binning and consensus bin selection",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["mag_summary", "mag_rank"],
+      "tools": ["MetaBAT2", "MaxBin2", "SemiBin2", "DAS Tool"],
+      "keywords": ["MAG", "bin", "binning", "consensus", "SemiBin2", "DAS Tool", "coverage", "tetramer"],
+      "typical_outputs": ["bin FASTA files", "bin score tables", "selected non-redundant bins"],
+      "metrics": [
+        {"name": "bin count", "meaning": "Number of candidate genome bins; more bins do not necessarily mean more high-quality or non-redundant genomes."},
+        {"name": "bin score", "meaning": "Tool-specific objective used to select bins, commonly combining completeness and contamination estimates; it is not a universal quality metric."},
+        {"name": "coverage/composition separation", "meaning": "Binners use abundance and/or sequence-composition signals, whose separability depends on samples, strain complexity, and assembly fragmentation."}
+      ],
+      "interpretation": [
+        "DAS Tool integrates candidate bins from multiple methods and selects a non-redundant set; evaluate the selected bins downstream with quality, taxonomy, and chimerism checks.",
+        "SemiBin2 can use learned sequence features with coverage information; GPU acceleration affects runtime, not the biological meaning of results."
+      ],
+      "caveats": [
+        "Closely related strains, mobile elements, shared repeats, uneven depth, and short contigs are major causes of mixed or incomplete bins.",
+        "Binning output is a hypothesis about genome membership, not a validated isolate genome.",
+        "Tool-specific scores should not be compared across algorithms as if calibrated identically."
+      ],
+      "sources": [
+        "https://semibin.readthedocs.io/en/stable/",
+        "https://www.nature.com/articles/s41564-018-0171-1"
+      ]
+    },
+    {
+      "id": "genome_quality_mimag",
+      "title": "Genome and MAG completeness, contamination and MIMAG quality",
+      "profiles": ["all"],
+      "renderers": ["checkm2_quality", "mag_summary", "mag_rank", "wgs_quality"],
+      "tools": ["CheckM", "CheckM2", "BUSCO", "MIMAG"],
+      "keywords": ["completeness", "contamination", "quality", "MIMAG", "BUSCO", "CheckM2", "high quality MAG"],
+      "typical_outputs": ["CheckM2 quality_report.tsv", "BUSCO summary", "quality tier counts"],
+      "metrics": [
+        {"name": "completeness", "meaning": "Estimated recovery of expected genome content from marker/model evidence; interpretation depends on lineage representation and the estimator."},
+        {"name": "contamination", "meaning": "Estimated duplicated or foreign genome content; strain heterogeneity and unusual biology can influence the estimate."},
+        {"name": "BUSCO complete/single-copy/duplicated", "meaning": "Status of lineage-specific conserved orthologs, useful for genome/gene-set assessment but not a direct contamination or correctness measurement."}
+      ],
+      "interpretation": [
+        "Use completeness and contamination as estimates, and cross-check discordant genomes with mapping, taxonomy, GUNC, assembly structure, and marker details.",
+        "MIMAG high-quality drafts require more than completeness/contamination, including defined rRNA and tRNA criteria and supporting metadata; do not assign that label from CheckM2 alone."
+      ],
+      "caveats": [
+        "Marker-based estimates can be biased for underrepresented, reduced, unusual, or highly divergent lineages.",
+        "A nominal quality tier does not establish assembly correctness or biological purity.",
+        "CheckM2 predictions are model estimates and should retain tool/database version provenance."
+      ],
+      "sources": [
+        "https://github.com/chklovski/CheckM2",
+        "https://pmc.ncbi.nlm.nih.gov/articles/PMC6436528/",
+        "https://busco.ezlab.org/busco_userguide.html"
+      ]
+    },
+    {
+      "id": "gunc_chimerism",
+      "title": "GUNC lineage-consistency and chimerism assessment",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["gunc_sankey", "mag_summary", "mag_rank"],
+      "tools": ["GUNC"],
+      "keywords": ["GUNC", "CSS", "RRS", "contamination", "chimerism", "pass", "fail", "mapped genes"],
+      "typical_outputs": ["gunc_maxcss.tsv", "gene-level taxonomic assignments"],
+      "metrics": [
+        {"name": "pass.GUNC", "meaning": "Tool decision derived from lineage-homogeneity statistics and configured thresholds; inspect the contributing metrics rather than treating it as infallible."},
+        {"name": "clade separation score", "meaning": "Degree to which genes split across taxonomic lineages at the reported taxonomic level."},
+        {"name": "reference representation score", "meaning": "How sufficiently the genome's genes map to the reference system for interpretation."},
+        {"name": "contamination portion", "meaning": "Estimated portion attributed to the inferred contaminating lineage signal."}
+      ],
+      "interpretation": [
+        "A fail is evidence of lineage inconsistency compatible with a chimeric/contaminated bin and should prompt gene/contig-level inspection and possible bin refinement.",
+        "The Sankey view should be used to locate the taxonomic level and lineages contributing to inconsistency."
+      ],
+      "caveats": [
+        "Low reference representation or too few mapped genes can make a genome difficult or impossible to score reliably.",
+        "Horizontal gene transfer, mobile elements, and database gaps can create lineage discordance that needs biological review.",
+        "GUNC complements rather than replaces completeness/contamination estimators."
+      ],
+      "sources": ["https://grp-bork.embl-community.io/gunc/usage.html"]
+    },
+    {
+      "id": "genome_taxonomy",
+      "title": "Genome taxonomy with GTDB-Tk, FastANI and marker evidence",
+      "profiles": ["all"],
+      "renderers": ["gtdbtk_taxonomy"],
+      "tools": ["GTDB-Tk", "FastANI", "BLAST"],
+      "keywords": ["taxonomy", "GTDB", "ANI", "alignment fraction", "RED", "closest genome", "16S"],
+      "typical_outputs": ["gtdbtk.bac120.summary.tsv", "gtdbtk.ar53.summary.tsv", "ANI tables", "16S alignments"],
+      "metrics": [
+        {"name": "classification", "meaning": "GTDB taxonomic assignment produced from reference-tree placement, relative evolutionary divergence, ANI and alignment fraction under the installed release."},
+        {"name": "fast ANI", "meaning": "Approximate nucleotide identity over homologous genomic regions; interpret with alignment fraction and assembly quality."},
+        {"name": "alignment fraction", "meaning": "Fraction represented by ANI-matched regions and essential context for similarity interpretation."},
+        {"name": "warnings/note", "meaning": "Flags conditions such as low marker recovery, multiple placements, or other limitations that can affect classification confidence."}
+      ],
+      "interpretation": [
+        "Report GTDB release and inspect classification method, closest reference, ANI, alignment fraction, tree placement, and warnings together.",
+        "Use 16S/BLAST or other marker evidence as complementary evidence, not as an automatic override of genome-wide classification."
+      ],
+      "caveats": [
+        "Taxonomic names and placements can change across GTDB/database releases.",
+        "Low-quality, incomplete, contaminated, or chimeric genomes can be misclassified or remain unresolved.",
+        "ANI calculated over limited aligned sequence can look high without broad genomic support."
+      ],
+      "sources": [
+        "https://ecogenomics.github.io/GTDBTk/files/summary.tsv.html",
+        "https://github.com/ParBLiSS/FastANI",
+        "https://blast.ncbi.nlm.nih.gov/doc/blast-help/FAQ.html"
+      ]
+    },
+    {
+      "id": "read_taxonomic_profiles",
+      "title": "Read-based taxonomic profiling and abundance",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["metaphlan_species", "metaphlan_rank", "metaphlan_alpha"],
+      "tools": ["MetaPhlAn", "Kraken2", "Bracken"],
+      "keywords": ["taxonomic profile", "relative abundance", "species", "Kraken2", "Bracken", "MetaPhlAn", "unclassified"],
+      "typical_outputs": ["MetaPhlAn profile", "Kraken report", "Bracken abundance table"],
+      "metrics": [
+        {"name": "relative abundance", "meaning": "Within-sample proportion assigned by a method; values are compositional and dependent on marker/reference databases and filtering."},
+        {"name": "classified/unclassified reads", "meaning": "Fractions with or without assignments under the selected database and confidence settings; unclassified does not mean biologically unknown in an absolute sense."},
+        {"name": "taxonomic rank", "meaning": "Resolution of an assignment. Species-level calls need sufficient discriminating evidence and are usually less robust than higher ranks."}
+      ],
+      "interpretation": [
+        "MetaPhlAn estimates clade abundance from marker genes; Kraken2 classifies k-mers and Bracken re-estimates abundance from Kraken classifications, so their percentages are not interchangeable.",
+        "Focus on dominant and reproducible patterns, controls, read support, and agreement across methods when available."
+      ],
+      "caveats": [
+        "Relative abundance is not absolute cell count, biomass, load, or activity.",
+        "Database content/version, closely related taxa, contamination, and host depletion strongly affect profiles.",
+        "Non-detection does not prove absence, especially for low-abundance organisms."
+      ],
+      "sources": [
+        "https://github.com/biobakery/MetaPhlAn",
+        "https://github.com/DerrickWood/kraken2/blob/master/docs/MANUAL.html",
+        "https://github.com/jenniferlu717/Bracken"
+      ]
+    },
+    {
+      "id": "coverm_mag_abundance",
+      "title": "MAG abundance and coverage with CoverM",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["coverm_abundance", "mag_rank", "mag_summary"],
+      "tools": ["CoverM"],
+      "keywords": ["CoverM", "MAG abundance", "TPM", "RPKM", "relative abundance", "covered fraction", "mean coverage"],
+      "typical_outputs": ["coverage.tsv", "genome abundance table"],
+      "metrics": [
+        {"name": "mean/trimmed mean coverage", "meaning": "Average depth across a genome after the tool's configured filtering/trimming; susceptibility to uncovered regions and peaks differs by statistic."},
+        {"name": "covered fraction", "meaning": "Fraction of genome positions meeting coverage requirements; useful for distinguishing broad support from small conserved-region matches."},
+        {"name": "relative abundance", "meaning": "CoverM-normalized within-sample abundance based on mapped reads and selected calculation; retain method and mapping thresholds."},
+        {"name": "TPM/RPKM", "meaning": "Length/library-normalized mapping quantities, not direct cell counts and not automatically comparable across workflows."
+        }
+      ],
+      "interpretation": [
+        "Interpret abundance only for quality-controlled, non-redundant MAGs and require adequate breadth to avoid over-interpreting sparse conserved-region mappings.",
+        "Use consistent mapper, identity, alignment, and normalization settings for comparisons."
+      ],
+      "caveats": [
+        "Multi-mapping among related MAGs and strain variation can distort abundance.",
+        "Genome size, copy-number variation, extraction bias, and sequencing bias prevent direct translation to cell counts.",
+        "A single sample cannot establish a statistically supported ecological difference."
+      ],
+      "sources": ["https://github.com/wwood/CoverM"]
+    },
+    {
+      "id": "diversity_interpretation",
+      "title": "Within-sample alpha diversity",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["metaphlan_alpha", "read_alpha"],
+      "tools": ["MetaPhlAn", "Kraken2", "Bracken"],
+      "keywords": ["alpha diversity", "Shannon", "Simpson", "richness", "evenness", "ecology"],
+      "typical_outputs": ["alpha-diversity summary computed from a taxonomic abundance table"],
+      "metrics": [
+        {"name": "richness", "meaning": "Number of detected taxa after the chosen filtering and rank; highly sensitive to depth, classification noise, and thresholding."},
+        {"name": "Shannon index", "meaning": "Combines richness and evenness using taxon proportions; the value depends on logarithm convention and taxonomic resolution."},
+        {"name": "Simpson index", "meaning": "Family of dominance/diversity quantities with multiple conventions; the exact formula must be stated before comparing values."}
+      ],
+      "interpretation": [
+        "Use alpha diversity to describe one profile, not to claim a treatment or group effect without replicated samples and statistical design.",
+        "Comparisons require consistent depth handling, taxonomic rank, database, filters, and index definitions."
+      ],
+      "caveats": [
+        "A higher index is not inherently healthier or better; meaning is ecosystem- and question-specific.",
+        "Classification errors and rare low-support taxa can inflate richness.",
+        "Read-based and MAG-based diversity describe different observable subsets and should not be directly equated."
+      ],
+      "sources": ["https://github.com/biobakery/MetaPhlAn"]
+    },
+    {
+      "id": "nonpareil_coverage",
+      "title": "Nonpareil metagenomic redundancy and coverage",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["nonpareil_curve"],
+      "tools": ["Nonpareil"],
+      "keywords": ["Nonpareil", "redundancy", "coverage", "sequencing effort", "diversity", "NRC", "Nd"],
+      "typical_outputs": [".npo redundancy model", "coverage curve"],
+      "metrics": [
+        {"name": "estimated coverage", "meaning": "Model-based estimate of the fraction of sequence space represented at the observed effort."},
+        {"name": "Nonpareil diversity", "meaning": "Sequence-level diversity estimate derived from read redundancy, not a taxon-count index."},
+        {"name": "projected effort", "meaning": "Model projection of additional sequencing needed for target coverage; uncertainty grows outside the observed range."}
+      ],
+      "interpretation": [
+        "Use the curve to assess diminishing returns and whether the sample's sequence diversity is well represented by current sequencing effort.",
+        "Compare samples only under compatible preprocessing, read lengths, and model settings."
+      ],
+      "caveats": [
+        "Coverage is model-based and not the same as mean mapping depth or the fraction of organisms detected.",
+        "Extrapolated sequencing requirements are uncertain, especially for highly complex or uneven communities.",
+        "Technical duplicates, host reads, and preprocessing can alter redundancy."
+      ],
+      "sources": ["https://nonpareil.readthedocs.io/en/latest/"]
+    },
+    {
+      "id": "structural_annotation",
+      "title": "Structural genome annotation with Prokka, Prodigal and barrnap",
+      "profiles": ["all"],
+      "renderers": ["prokka_features", "wgs_prokka"],
+      "tools": ["Prokka", "Prodigal", "barrnap"],
+      "keywords": ["annotation", "CDS", "rRNA", "tRNA", "gene count", "hypothetical protein", "Prokka"],
+      "typical_outputs": ["GFF", "GenBank", "FAA", "FFN", "TSV", "annotation counts"],
+      "metrics": [
+        {"name": "CDS count", "meaning": "Number of predicted coding sequences under the gene caller and contig context; fragmentation can split or truncate genes."},
+        {"name": "hypothetical proteins", "meaning": "Predicted proteins without a confident named function in the annotation hierarchy; not necessarily novel or nonfunctional."},
+        {"name": "rRNA/tRNA count", "meaning": "Detected structural RNA features; absence can reflect incompleteness, assembly fragmentation, or detection limits."}
+      ],
+      "interpretation": [
+        "Use feature counts as assembly/annotation summaries and inspect individual annotations with coordinates, evidence, and protein/domain results.",
+        "A genome browser shows genomic context and synteny that counts alone cannot capture."
+      ],
+      "caveats": [
+        "Automated names are database- and rule-dependent predictions, not experimental functional validation.",
+        "Contig-edge genes, frameshifts, polishing errors, and divergent proteins can be missed or misannotated.",
+        "Annotation database and software versions are essential provenance."
+      ],
+      "sources": [
+        "https://github.com/tseemann/prokka",
+        "https://github.com/tseemann/barrnap"
+      ]
+    },
+    {
+      "id": "protein_function_annotation",
+      "title": "Protein domains, orthology and pathway annotation",
+      "profiles": ["all"],
+      "renderers": ["wgs_cog", "wgs_interpro", "wgs_kofam"],
+      "tools": ["InterProScan", "eggNOG-mapper", "KOfamScan"],
+      "keywords": ["InterPro", "eggNOG", "COG", "KEGG", "KO", "pathway", "domain", "orthology", "function"],
+      "typical_outputs": ["InterPro TSV", "eggNOG annotations", "KOfam KO assignments"],
+      "metrics": [
+        {"name": "domain/signature hit", "meaning": "Sequence match to a member database signature. Coverage, score, e-value, and domain architecture determine how informative it is."},
+        {"name": "ortholog/COG category", "meaning": "Function transferred through inferred orthology or orthologous group membership; broad categories summarize potential rather than precise activity."},
+        {"name": "KO assignment", "meaning": "KEGG Orthology prediction using profile thresholds; pathway reconstruction generally requires combinations of KOs."}
+      ],
+      "interpretation": [
+        "Prefer concordant evidence from curated orthology, domain architecture, and pathway completeness over a single weak hit.",
+        "Use pathway/module context to distinguish an isolated homolog from a more complete encoded capability."
+      ],
+      "caveats": [
+        "All are sequence-based predictions of encoded potential, not gene expression, enzyme activity, flux, or phenotype.",
+        "Paralogs, multidomain proteins, partial genes, and remote homology can produce ambiguous assignments.",
+        "Database release and score/coverage thresholds affect counts and labels."
+      ],
+      "sources": [
+        "https://interproscan-docs.readthedocs.io/en/v5/OutputFormats.html",
+        "https://github.com/eggnogdb/eggnog-mapper/blob/main/USAGE.md",
+        "https://github.com/takaram/kofam_scan"
+      ]
+    },
+    {
+      "id": "cazy_dbcan",
+      "title": "Carbohydrate-active enzyme annotation with dbCAN",
+      "profiles": ["all"],
+      "renderers": ["dbcan_composition", "wgs_cazymes"],
+      "tools": ["dbCAN", "HMMER", "DIAMOND", "dbCAN-sub"],
+      "keywords": ["CAZyme", "dbCAN", "GH", "GT", "PL", "CE", "AA", "CBM", "carbohydrate"],
+      "typical_outputs": ["overview table", "CAZyme family counts", "substrate predictions", "CGC output"],
+      "metrics": [
+        {"name": "CAZyme family", "meaning": "Predicted membership in a carbohydrate-active enzyme family; family membership may encompass multiple substrates or activities."},
+        {"name": "tool support", "meaning": "Agreement among HMM/database/subfamily methods. Multiple methods can increase confidence but are not independent experimental validations."},
+        {"name": "gene cluster", "meaning": "Genomic neighborhood consistent with coordinated carbohydrate utilization; context strengthens but does not prove a specific substrate phenotype."}
+      ],
+      "interpretation": [
+        "Interpret family composition with genome size/completeness and examine subfamily or gene-cluster context before assigning a substrate or reaction.",
+        "For MAG comparisons, normalize and filter consistently and avoid treating raw family counts as direct activities."
+      ],
+      "caveats": [
+        "A CAZy family hit indicates sequence similarity and potential, not expression, secretion, substrate use, or measured degradation.",
+        "Partial genes and assembly fragmentation can reduce or split hits.",
+        "Substrate predictions can be broad or uncertain."
+      ],
+      "sources": ["https://dbcan.readthedocs.io/en/latest/"]
+    },
+    {
+      "id": "amr_abricate",
+      "title": "Acquired antimicrobial-resistance gene screening",
+      "profiles": ["all"],
+      "renderers": ["wgs_amr"],
+      "tools": ["ABRicate"],
+      "keywords": ["AMR", "resistance", "ABRicate", "identity", "coverage", "gene", "database"],
+      "typical_outputs": ["ABRicate tabular hits and summary"],
+      "metrics": [
+        {"name": "percent identity", "meaning": "Sequence identity between the assembled query region and database reference over the reported alignment."},
+        {"name": "percent coverage", "meaning": "Fraction of the reference resistance gene covered by the hit; truncated hits need careful review."},
+        {"name": "database/gene", "meaning": "Reference collection and allele/family label supporting the reported match."}
+      ],
+      "interpretation": [
+        "Prioritize high-quality, well-covered hits, then inspect genomic context, assembly support, gene integrity, database provenance, and organism relevance.",
+        "Report detected acquired resistance determinants as genomic predictions requiring appropriate confirmation."
+      ],
+      "caveats": [
+        "ABRicate searches assembled contigs for acquired genes and does not comprehensively detect chromosomal point mutations, regulatory resistance, expression, or susceptibility phenotype.",
+        "A gene hit must not be translated directly into a clinical treatment recommendation.",
+        "Database scope/version and assembly fragmentation affect detection."
+      ],
+      "sources": ["https://github.com/tseemann/ABRICATE"]
+    },
+    {
+      "id": "crispr_cctyper",
+      "title": "CRISPR-Cas subtype and locus architecture",
+      "profiles": ["all"],
+      "renderers": ["cctyper_synteny", "cctyper_subtypes", "cctyper_genemap"],
+      "tools": ["CRISPRCasTyper"],
+      "keywords": ["CRISPR", "Cas", "CCTyper", "subtype", "synteny", "repeat", "array", "genemap"],
+      "typical_outputs": ["cas_operons.tab", "CRISPR arrays", "locus gene maps", "subtype predictions"],
+      "metrics": [
+        {"name": "predicted subtype", "meaning": "Classification inferred from Cas protein profiles and locus organization."},
+        {"name": "locus completeness", "meaning": "Presence/order of expected components; partial contigs and fragmented assemblies can truncate systems."},
+        {"name": "array/spacer count", "meaning": "Detected CRISPR repeat-spacer structures under tool thresholds; counts can vary with assembly and repeat detection."}
+      ],
+      "interpretation": [
+        "Use the gene/synteny map to assess whether Cas genes form a coherent locus and whether the predicted subtype matches the component order.",
+        "Inspect partial or mixed loci cautiously, particularly at contig boundaries or in MAGs."
+      ],
+      "caveats": [
+        "A predicted CRISPR-Cas locus does not prove present activity, immunity, spacer target, or editing capability.",
+        "Mobile elements, divergent Cas proteins, fragmented contigs, and mixed bins can confuse subtype assignment.",
+        "Spacer-to-target analyses require separate evidence."
+      ],
+      "sources": ["https://github.com/Russel88/CRISPRCasTyper"]
+    },
+    {
+      "id": "secondary_metabolites",
+      "title": "Biosynthetic gene clusters with antiSMASH",
+      "profiles": ["all"],
+      "renderers": [],
+      "tools": ["antiSMASH"],
+      "keywords": ["antiSMASH", "BGC", "biosynthetic", "cluster", "secondary metabolite", "NRPS", "PKS"],
+      "typical_outputs": ["antiSMASH HTML report", "region GenBank files", "cluster tables"],
+      "metrics": [
+        {"name": "region/product class", "meaning": "Rule-based prediction that a genomic region encodes machinery associated with a biosynthetic class."},
+        {"name": "known-cluster similarity", "meaning": "Similarity to characterized clusters; it is evidence about related architecture, not proof of an identical product."},
+        {"name": "region boundaries", "meaning": "Predicted genomic interval that can include uncertain flanking genes and can be truncated at contig edges."}
+      ],
+      "interpretation": [
+        "Prioritize complete, well-supported regions with coherent core/biosynthetic genes and carefully interpret similarity to known clusters.",
+        "Use the embedded antiSMASH report for domain organization, gene context, and cluster-comparison evidence."
+      ],
+      "caveats": [
+        "A BGC predicts biosynthetic potential, not expression, production, chemical identity, yield, or bioactivity.",
+        "Fragmented assemblies and MAG contamination can split or misassign clusters.",
+        "Novel clusters often cannot be mapped reliably to a specific product."
+      ],
+      "sources": ["https://docs.antismash.secondarymetabolites.org/"]
+    },
+    {
+      "id": "viral_virsorter2",
+      "title": "Viral sequence prediction with VirSorter2",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["virsorter_scores"],
+      "tools": ["VirSorter2", "CheckV"],
+      "keywords": ["virus", "viral", "VirSorter2", "score", "boundary", "provirus", "CheckV"],
+      "typical_outputs": ["final-viral-score.tsv", "final-viral-boundary.tsv", "viral FASTA"],
+      "metrics": [
+        {"name": "viral score", "meaning": "Model score used to prioritize sequences within the selected viral groups and configuration; it is not a universal probability of being viral."},
+        {"name": "viral group", "meaning": "Model/category supporting a candidate such as dsDNA phage or ssDNA virus under the installed database."},
+        {"name": "boundary", "meaning": "Predicted viral/proviral interval. Boundary output can be intermediate and should be refined/validated before final reporting."}
+      ],
+      "interpretation": [
+        "Treat VirSorter2 as a sensitive candidate-discovery step and validate candidates with quality/completeness, hallmark genes, contamination checks, and contextual evidence.",
+        "The developers recommend CheckV after VirSorter2 to refine boundaries and assess viral genome quality."
+      ],
+      "caveats": [
+        "Score alone is insufficient to claim a confirmed virus or complete viral genome.",
+        "Plasmids, mobile elements, short contigs, integrated elements, and host regions can complicate classification.",
+        "Default workflows favor sensitivity and may include false positives requiring downstream filtering."
+      ],
+      "sources": ["https://github.com/jiarong/VirSorter2"]
+    },
+    {
+      "id": "hadeg_degradation",
+      "title": "HADEG hydrocarbon-degradation gene potential",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["hadeg_network"],
+      "tools": ["HADEG", "Proteinortho"],
+      "keywords": ["HADEG", "hydrocarbon", "degradation", "ortholog", "network", "bioremediation"],
+      "typical_outputs": ["Results_HADEG.proteinortho.tsv", "gene/pathway network"],
+      "metrics": [
+        {"name": "orthologous hit", "meaning": "Sequence-cluster evidence linking a predicted protein to HADEG's curated degradation-gene collection."},
+        {"name": "pathway/gene coverage", "meaning": "Breadth of recovered components associated with a degradation route; a more coherent set is stronger genomic-potential evidence than one isolated hit."},
+        {"name": "network degree", "meaning": "Visualization property reflecting connections in the annotation network, not biochemical activity or causal importance."}
+      ],
+      "interpretation": [
+        "Use the network to identify coherent collections of degradation-associated genes and inspect their genome/MAG origin, completeness, taxonomy, and supporting annotations.",
+        "Describe results as encoded degradation potential or similarity to characterized proteins."
+      ],
+      "caveats": [
+        "Homology does not establish substrate specificity, expression, pathway flux, environmental activity, or successful bioremediation.",
+        "Isolated hits, partial proteins, contamination, and paralogy need cautious review.",
+        "Confirm important claims with domain/context analysis and appropriate experimental or multi-omic evidence."
+      ],
+      "sources": [
+        "https://doi.org/10.1016/j.compbiolchem.2023.107966",
+        "https://github.com/jarojasva/HADEG"
+      ]
+    },
+    {
+      "id": "repeat_annotation",
+      "title": "Repeat and low-complexity annotation",
+      "profiles": ["wgs:short", "wgs:long", "wgs:hybrid"],
+      "renderers": ["wgs_repeats"],
+      "tools": ["RepeatMasker"],
+      "keywords": ["repeat", "RepeatMasker", "transposable element", "low complexity", "masked", "interspersed"],
+      "typical_outputs": ["masked FASTA", ".out annotation", "repeat class summary"],
+      "metrics": [
+        {"name": "masked fraction", "meaning": "Fraction annotated/masked as repeat or low-complexity sequence under the selected libraries and settings."},
+        {"name": "repeat class/family", "meaning": "Best supported repeat-library classification; divergent or novel elements can remain unclassified."},
+        {"name": "copy count", "meaning": "Number of reported repeat fragments/hits, not necessarily the number of intact biological elements."}
+      ],
+      "interpretation": [
+        "Use repeat composition and genome-map context to describe assembly complexity and candidate mobile/repetitive regions.",
+        "Evaluate repeat-rich contig edges and fragmented hits in relation to assembly continuity."
+      ],
+      "caveats": [
+        "RepeatMasker is library-dependent; absence of a named repeat does not prove absence.",
+        "Fragmented assemblies can split a single repeat into multiple annotations.",
+        "Repeat annotation does not itself establish mobility or current activity."
+      ],
+      "sources": ["https://github.com/Dfam-consortium/RepeatMasker/blob/master/repeatmasker.help"]
+    },
+    {
+      "id": "dereplication",
+      "title": "Genome/MAG dereplication and clustering",
+      "profiles": ["metagenomics:short", "metagenomics:long", "metagenomics:hybrid"],
+      "renderers": ["mag_summary", "mag_rank"],
+      "tools": ["dRep", "FastANI", "CD-HIT"],
+      "keywords": ["dereplication", "dRep", "ANI", "cluster", "representative", "redundant", "CD-HIT"],
+      "typical_outputs": ["genome clusters", "representative genome list", "ANI comparisons", "dereplicated FASTA set"],
+      "metrics": [
+        {"name": "primary/secondary cluster", "meaning": "Groups created under configured coarse/fine similarity procedures; membership depends on thresholds and comparison coverage."},
+        {"name": "representative score", "meaning": "Tool-specific ranking combining quality attributes; it selects a representative but does not make other members biologically irrelevant."},
+        {"name": "ANI", "meaning": "Genome sequence identity across comparable regions; alignment coverage remains necessary context."}
+      ],
+      "interpretation": [
+        "Dereplication reduces redundant genomes for abundance/taxonomy summaries while retaining cluster membership for strain- or population-level follow-up.",
+        "Report thresholds, algorithms, quality filters, and representative-selection formula."
+      ],
+      "caveats": [
+        "Clustering thresholds encode an operational definition, not a universal species boundary for every lineage.",
+        "Incomplete or contaminated genomes can distort similarity and representative selection.",
+        "CD-HIT sequence clustering and genome-wide ANI solve different similarity problems and should not be conflated."
+      ],
+      "sources": [
+        "https://github.com/MrOlm/drep/blob/master/docs/example_output.rst",
+        "https://github.com/ParBLiSS/FastANI",
+        "https://www.bioinformatics.org/cd-hit/cd-hit-user-guide"
+      ]
+    }
+  ]
+}

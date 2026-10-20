@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "wgs:long",
+  "sample": "DEMO_ECOLI_LONG",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example long-read isolate workflow with read QC, adaptive filtering, assembly, polishing, genome QC, and annotation outputs."
+}

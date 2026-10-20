@@ -1,0 +1,10 @@
+{
+  "sample_id": "DEMO_COMMUNITY_LONG",
+  "demo": true,
+  "plot_data": [
+    {"Name": "MAG_001", "Completeness": 96.4, "Contamination": 1.1, "Zone": "High quality"},
+    {"Name": "MAG_002", "Completeness": 88.7, "Contamination": 3.2, "Zone": "Medium quality"},
+    {"Name": "MAG_003", "Completeness": 73.1, "Contamination": 6.8, "Zone": "Medium quality"}
+  ],
+  "summary": {"high_quality_mags": 8, "medium_quality_mags": 17, "illustrative": true}
+}

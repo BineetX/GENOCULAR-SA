@@ -1,0 +1,1081 @@
+import pandas as pd
+import os
+
+# ─────────────────────────────────────────────────────────────
+# BASE CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+base_path = config.get("BASE",
+            os.environ.get("BASE_PATH",
+            "/home/rashmi/Marine"))
+
+_samples_csv_raw = config.get("SAMPLES",
+                   os.environ.get("SAMPLES_CSV",
+                   "samples_short.csv"))
+
+samples_csv = _samples_csv_raw if os.path.isabs(_samples_csv_raw) \
+              else os.path.join(base_path, _samples_csv_raw)
+
+os.makedirs(f"{base_path}/Combine", exist_ok=True)
+
+samples_df = pd.read_csv(samples_csv)
+samples = samples_df['sample'].tolist()
+
+print(f"[Config] base_path = {base_path}")
+print(f"[Config] samples_csv = {samples_csv}")
+print(f"[Config] samples = {samples}")
+
+# Tool paths
+trimmomatic_jar = f"{base_path}/trimmomatic-0.39.jar"
+adapter_file = "/home/rashmi/.conda/envs/marine/share/trimmomatic/adapters/TruSeq3-PE-2.fa"
+kraken_db_path = "/home/ilsdatabank/kraken_db/kraken_bacteria_db"
+kraken_tools_path = "/home/rashmi/Marine/KrakenTools"
+BUSCO_LINEAGE = "bacteria_odb12"
+KOFAM_PROFILE = "/home/rashmi/.conda/envs/kofamscan_env/bin/kofamscan_db/profiles"
+KOFAM_KO_LIST = "/home/rashmi/.conda/envs/kofamscan_env/bin/kofamscan_db/ko_list"
+ANTISMASH_DB = "/home/rashmi/.conda/envs/antismash8/lib/python3.11/site-packages/antismash/databases"
+DBCAN_DB_DIR = "/home/rashmi/.conda/envs/dbcan/dbcan_db/db"
+HADEG_DB = "/home/rashmi/.conda/envs/hadeg/share/hadeg/HADEG_protein_database_231119.faa"
+HADEG_RSCRIPT = "/home/rashmi/.conda/envs/hadeg/share/hadeg/HADEG.R"
+
+# Conda environments
+CONDA_ENVS = {
+    "marine": "/home/rashmi/.conda/envs/marine",
+    "fastqc_env": "/home/rashmi/.conda/envs/fastqc_env",
+    "kraken2": "/home/rashmi/.conda/envs/kraken2",
+    "kraken2_env": "/home/rashmi/.conda/envs/kraken2_env",
+    "cutadapt": "/home/rashmi/.conda/envs/cutadapt",
+    "prokka": "/home/rashmi/.conda/envs/prokka",
+    "interproscan": "/home/rashmi/.conda/envs/interproscan_env",
+    "quast": "/home/rashmi/.conda/envs/quast",
+    "busco": "/home/rashmi/.conda/envs/busco",
+    "checkm": "/home/rashmi/.conda/envs/checkm",
+    "abricate": "/home/rashmi/.conda/envs/abricate",
+    "kofamscan": "kofamscan_env",
+    "dbcan": "/home/rashmi/.conda/envs/dbcan",
+    "eggnog": "/home/rashmi/.conda/envs/eggnog-mapper",
+    "crispr": "/home/rashmi/.conda/envs/crisprcasfinder",
+    "antismash": "/home/rashmi/.conda/envs/antismash8",
+    "hadeg": "/home/rashmi/.conda/envs/hadeg",
+    "barrnap": "/home/rashmi/.conda/envs/barrnap",
+    "fastani": "/home/rashmi/.conda/envs/fastani",
+}
+
+# ─────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────
+def get_sample_fastq(wildcards, col):
+    path = f"{base_path}/{samples_df.loc[samples_df['sample'] == wildcards.sample, col].values[0]}"
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing input file: {path}")
+    return path
+
+# ─────────────────────────────────────────────────────────────
+# RULE ALL
+# ─────────────────────────────────────────────────────────────
+rule all:
+    input:
+        expand(f"{base_path}/Combine/{{sample}}/spades_output/contigs.fasta", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/prokka/annotated_genome.gff", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/interproscan/interproscan_results.tsv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/busco/{{sample}}_busco_output/short_summary.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/checkm_output/checkm.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/quast/report.html", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/prodigal/genes.coords", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/prodigal/proteins.faa", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/prodigal/genes.fna", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/abricate/abricate_resfinder.csv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/abricate/abricate_ncbi.csv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/abricate/abricate_card.csv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/abricate/abricate_vfdb.csv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/abricate/abricate_plasmidfinder.csv", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/kofamscan/kofamscan_results.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/dbcan/overview.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/emapper_results/annotations.emapper.annotations", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/crispr_output/crispr_summary.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/antismash_results/knownclusterblast.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/repeatmasker/contigs.masked.fasta", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/kraken2_report.txt", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/kraken_classified/{{sample}}_classified_R1.fastq", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/kraken_classified/{{sample}}_classified_R2.fastq", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/hadeg/hadeg_done.flag", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/barrnap/contigs_16s.fasta", sample=samples),
+        expand(f"{base_path}/Combine/{{sample}}/fastani/fastani_results.txt", sample=samples),
+
+# ─────────────────────────────────────────────────────────────
+# STEP 0: FastQC pre-trimming
+# ─────────────────────────────────────────────────────────────
+rule fastqc_raw:
+    input:
+        R1 = lambda wildcards: get_sample_fastq(wildcards, 'R1'),
+        R2 = lambda wildcards: get_sample_fastq(wildcards, 'R2')
+    output:
+        html_R1 = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.html",
+        html_R2 = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R2_fastqc.html",
+        zip_R1  = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.zip",
+        zip_R2  = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R2_fastqc.zip"
+    params:
+        outdir = f"{base_path}/Combine/{{sample}}/fastqc_raw",
+        env_path = CONDA_ENVS["fastqc_env"]
+    threads: 2
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/fastqc_raw.log"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        FASTQC_BIN="{params.env_path}/bin/fastqc"
+        if [ ! -x "$FASTQC_BIN" ]; then
+            FASTQC_BIN=$(which fastqc 2>/dev/null || true)
+        fi
+        if [ ! -x "$FASTQC_BIN" ]; then
+            echo "ERROR: fastqc not found" >&2
+            exit 1
+        fi
+
+        echo "[FastQC] Using: $FASTQC_BIN" | tee {log}
+        fastqc -t {threads} -o {params.outdir} {input.R1} {input.R2} &>> {log}
+        """
+
+# ─────────────────────────────────────────────────────────────
+# STEP 1: Adaptive Trimmomatic
+# ─────────────────────────────────────────────────────────────
+rule trimmomatic:
+    input:
+        R1 = lambda wildcards: get_sample_fastq(wildcards, 'R1'),
+        R2 = lambda wildcards: get_sample_fastq(wildcards, 'R2'),
+        qc_zip = rules.fastqc_raw.output.zip_R1
+    output:
+        paired_R1 = f"{base_path}/Combine/{{sample}}/{{sample}}_R1_paired.fastq",
+        unpaired_R1 = f"{base_path}/Combine/{{sample}}/{{sample}}_R1_unpaired.fastq",
+        paired_R2 = f"{base_path}/Combine/{{sample}}/{{sample}}_R2_paired.fastq",
+        unpaired_R2 = f"{base_path}/Combine/{{sample}}/{{sample}}_R2_unpaired.fastq"
+    params:
+        adapter_file = adapter_file,
+        env_path = CONDA_ENVS["marine"]
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/trimmomatic.log"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.paired_R1}) $(dirname {log})
+
+        TMPDIR_QC=$(mktemp -d)
+        unzip -q {input.qc_zip} -d "$TMPDIR_QC"
+        QC_DATA=$(find "$TMPDIR_QC" -name "fastqc_data.txt" | head -1)
+
+        MEAN_Q=$(awk '/>>Per base sequence quality/,/>>END_MODULE/' "$QC_DATA" \
+                 | grep -v '^#' | grep -v '>>' \
+                 | awk '{{sum+=$2; n++}} END{{if(n>0) printf "%d", sum/n; else print 20}}')
+
+        ADAPT_PCT=$(awk '/>>Adapter Content/,/>>END_MODULE/' "$QC_DATA" \
+                    | grep -v '^#' | grep -v '>>' \
+                    | awk 'NR==1{{max=$2; for(i=3;i<=NF;i++) if($i>max) max=$i}} END{{printf "%d", max+0}}')
+
+        GC=$(awk '/>>Basic Statistics/,/>>END_MODULE/' "$QC_DATA" \
+             | awk -F'\t' '$1=="%GC"{{print $2}}')
+        GC=${{GC:-50}}
+
+        rm -rf "$TMPDIR_QC"
+
+        if [ "$MEAN_Q" -lt 20 ]; then
+            SW="SLIDINGWINDOW:4:15"
+            LEADING="LEADING:5"
+            TRAILING="TRAILING:5"
+        elif [ "$MEAN_Q" -lt 28 ]; then
+            SW="SLIDINGWINDOW:4:20"
+            LEADING="LEADING:3"
+            TRAILING="TRAILING:3"
+        else
+            SW="SLIDINGWINDOW:4:25"
+            LEADING="LEADING:3"
+            TRAILING="TRAILING:3"
+        fi
+
+        if [ "$GC" -gt 60 ]; then
+            MINLEN="MINLEN:36"
+        else
+            MINLEN="MINLEN:50"
+        fi
+
+        if [ "$ADAPT_PCT" -gt 1 ]; then
+            CLIP="ILLUMINACLIP:{params.adapter_file}:2:30:10"
+        else
+            CLIP=""
+        fi
+
+        echo "[Trimmomatic] MeanQ=$MEAN_Q AdapterPct=$ADAPT_PCT GC=$GC" | tee -a {log}
+        echo "[Trimmomatic] SW=$SW LEADING=$LEADING TRAILING=$TRAILING MINLEN=$MINLEN CLIP=$CLIP" | tee -a {log}
+
+        java -jar {trimmomatic_jar} PE -phred33 -threads {threads} \
+            {input.R1} {input.R2} \
+            {output.paired_R1} {output.unpaired_R1} \
+            {output.paired_R2} {output.unpaired_R2} \
+            $CLIP $LEADING $TRAILING $SW $MINLEN &>> {log}
+        """
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2: Adaptive Cutadapt
+# ─────────────────────────────────────────────────────────────
+rule cutadapt_paired:
+    input:
+        paired_R1 = rules.trimmomatic.output.paired_R1,
+        paired_R2 = rules.trimmomatic.output.paired_R2,
+        qc_zip = rules.fastqc_raw.output.zip_R1
+    output:
+        trimmed_R1 = f"{base_path}/Combine/{{sample}}/{{sample}}_R1_trimmed.fastq",
+        trimmed_R2 = f"{base_path}/Combine/{{sample}}/{{sample}}_R2_trimmed.fastq"
+    params:
+        env_path = CONDA_ENVS["cutadapt"]
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/cutadapt_paired.log"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.trimmed_R1}) $(dirname {log})
+
+        TMPDIR_QC=$(mktemp -d)
+        unzip -q {input.qc_zip} -d "$TMPDIR_QC"
+        QC_DATA=$(find "$TMPDIR_QC" -name "fastqc_data.txt" | head -1)
+
+        MEAN_Q=$(awk '/>>Per base sequence quality/,/>>END_MODULE/' "$QC_DATA" \
+                 | grep -v '^#' | grep -v '>>' \
+                 | awk '{{sum+=$2; n++}} END{{if(n>0) printf "%d", sum/n; else print 20}}')
+
+        ADAPT_PCT=$(awk '/>>Adapter Content/,/>>END_MODULE/' "$QC_DATA" \
+                    | grep -v '^#' | grep -v '>>' \
+                    | awk 'NR==1{{max=$2; for(i=3;i<=NF;i++) if($i>max) max=$i}} END{{printf "%d", max+0}}')
+
+        rm -rf "$TMPDIR_QC"
+
+        if [ "$ADAPT_PCT" -le 1 ]; then
+            echo "[Cutadapt] Adapter content $ADAPT_PCT% <= 1% — skipping" | tee -a {log}
+            ln -sf $(realpath {input.paired_R1}) {output.trimmed_R1}
+            ln -sf $(realpath {input.paired_R2}) {output.trimmed_R2}
+        else
+            if [ "$MEAN_Q" -lt 20 ]; then Q_CUT=15
+            elif [ "$MEAN_Q" -lt 28 ]; then Q_CUT=20
+            else Q_CUT=25; fi
+
+            echo "[Cutadapt] Adapter content $ADAPT_PCT% QualityCutoff=$Q_CUT" | tee -a {log}
+            cutadapt -q $Q_CUT -j {threads} \
+                -o {output.trimmed_R1} -p {output.trimmed_R2} \
+                {input.paired_R1} {input.paired_R2} &>> {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: Adaptive Seqtk
+# ─────────────────────────────────────────────────────────────
+rule seqtk_trim:
+    input:
+        trimmed_R1 = rules.cutadapt_paired.output.trimmed_R1,
+        trimmed_R2 = rules.cutadapt_paired.output.trimmed_R2,
+        qc_zip     = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.zip"
+    output:
+        trimmed_R1_seqtk = f"{base_path}/Combine/{{sample}}/{{sample}}_R1_seqtk_trimmed.fastq",
+        trimmed_R2_seqtk = f"{base_path}/Combine/{{sample}}/{{sample}}_R2_seqtk_trimmed.fastq"
+    params:
+        env_path = CONDA_ENVS["marine"]
+    threads: 2
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/seqtk_trim.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.trimmed_R1_seqtk}) $(dirname {log})
+
+        TMPDIR_QC=$(mktemp -d)
+        unzip -q {input.qc_zip} -d "$TMPDIR_QC"
+        QC_DATA=$(find "$TMPDIR_QC" -name "fastqc_data.txt" | head -1)
+        MEAN_Q=$(awk '/>>Per base sequence quality/,/>>END_MODULE/' "$QC_DATA" \
+                 | grep -v '^#' | grep -v '>>' \
+                 | awk '{{sum+=$2; n++}} END{{if(n>0) printf "%d", sum/n; else print 20}}')
+        rm -rf "$TMPDIR_QC"
+
+        if [ "$MEAN_Q" -ge 28 ]; then
+            echo "[Seqtk] High-quality (Q=$MEAN_Q) — skipping, symlinking" | tee -a {log}
+            ln -sf $(realpath {input.trimmed_R1}) {output.trimmed_R1_seqtk}
+            ln -sf $(realpath {input.trimmed_R2}) {output.trimmed_R2_seqtk}
+        else
+            Q_TRIM=$(( MEAN_Q < 20 ? 15 : 20 ))
+            echo "[Seqtk] Trimming with quality threshold $Q_TRIM" | tee -a {log}
+            seqtk trimfq -q 0.$(( 100 - Q_TRIM )) {input.trimmed_R1} > {output.trimmed_R1_seqtk} 2>> {log}
+            seqtk trimfq -q 0.$(( 100 - Q_TRIM )) {input.trimmed_R2} > {output.trimmed_R2_seqtk} 2>> {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4: Adaptive BBDuk
+# ─────────────────────────────────────────────────────────────
+rule bbduk:
+    input:
+        trimmed_R1_seqtk = rules.seqtk_trim.output.trimmed_R1_seqtk,
+        trimmed_R2_seqtk = rules.seqtk_trim.output.trimmed_R2_seqtk,
+        qc_zip           = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.zip"
+    output:
+        cleaned_R1 = f"{base_path}/Combine/{{sample}}/{{sample}}_R1_bbduk_cleaned.fastq",
+        cleaned_R2 = f"{base_path}/Combine/{{sample}}/{{sample}}_R2_bbduk_cleaned.fastq"
+    params:
+        env_path = CONDA_ENVS["marine"]
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/bbduk.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.cleaned_R1}) $(dirname {log})
+
+        TMPDIR_QC=$(mktemp -d)
+        unzip -q {input.qc_zip} -d "$TMPDIR_QC"
+        QC_DATA=$(find "$TMPDIR_QC" -name "fastqc_data.txt" | head -1)
+        MEAN_Q=$(awk '/>>Per base sequence quality/,/>>END_MODULE/' "$QC_DATA" \
+                 | grep -v '^#' | grep -v '>>' \
+                 | awk '{{sum+=$2; n++}} END{{if(n>0) printf "%d", sum/n; else print 20}}')
+        rm -rf "$TMPDIR_QC"
+
+        if [ "$MEAN_Q" -ge 28 ]; then
+            echo "[BBDuk] High-quality (Q=$MEAN_Q) — skipping, symlinking" | tee -a {log}
+            ln -sf $(realpath {input.trimmed_R1_seqtk}) {output.cleaned_R1}
+            ln -sf $(realpath {input.trimmed_R2_seqtk}) {output.cleaned_R2}
+        elif [ "$MEAN_Q" -lt 20 ]; then
+            echo "[BBDuk] Low-quality (Q=$MEAN_Q) — full cleaning with entropy filter" | tee -a {log}
+            bbduk.sh \
+                in={input.trimmed_R1_seqtk} in2={input.trimmed_R2_seqtk} \
+                out={output.cleaned_R1} out2={output.cleaned_R2} \
+                ref=adapters ktrim=r k=23 mink=11 hdist=1 tpe tbo \
+                entropy=0.5 entropywindow=50 entropyk=5 \
+                qtrim=rl trimq=15 &>> {log}
+        else
+            echo "[BBDuk] Standard quality (Q=$MEAN_Q) — k-mer adapter removal only" | tee -a {log}
+            bbduk.sh \
+                in={input.trimmed_R1_seqtk} in2={input.trimmed_R2_seqtk} \
+                out={output.cleaned_R1} out2={output.cleaned_R2} \
+                ref=adapters ktrim=r k=23 mink=11 hdist=1 tpe tbo &>> {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4b: FastQC post-trimming
+# ─────────────────────────────────────────────────────────────
+rule fastqc_trimmed:
+    input:
+        R1 = rules.bbduk.output.cleaned_R1,
+        R2 = rules.bbduk.output.cleaned_R2
+    output:
+        html_R1 = f"{base_path}/Combine/{{sample}}/fastqc_trimmed/{{sample}}_R1_bbduk_cleaned_fastqc.html",
+        html_R2 = f"{base_path}/Combine/{{sample}}/fastqc_trimmed/{{sample}}_R2_bbduk_cleaned_fastqc.html"
+    params:
+        outdir   = f"{base_path}/Combine/{{sample}}/fastqc_trimmed",
+        env_path = CONDA_ENVS["fastqc_env"]
+    threads: 2
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/fastqc_trimmed.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        FASTQC_BIN="{params.env_path}/bin/fastqc"
+        if [ ! -x "$FASTQC_BIN" ]; then
+            FASTQC_BIN=$(which fastqc 2>/dev/null || true)
+        fi
+        if [ ! -x "$FASTQC_BIN" ]; then
+            echo "ERROR: fastqc not found" >&2; exit 1
+        fi
+
+        "$FASTQC_BIN" -t {threads} -o {params.outdir} {input.R1} {input.R2} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 5: Kraken2 classification
+# ─────────────────────────────────────────────────────────────
+rule kraken_classify:
+    input:
+        R1 = rules.bbduk.output.cleaned_R1,
+        R2 = rules.bbduk.output.cleaned_R2
+    output:
+        report             = f"{base_path}/Combine/{{sample}}/kraken2_report.txt",
+        kraken_output_file = f"{base_path}/Combine/{{sample}}/kraken2_output.txt"
+    params:
+        db_path  = kraken_db_path,
+        env_path = CONDA_ENVS["kraken2_env"]
+    threads: 8
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/kraken_classify.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        kraken2 --db {params.db_path} --threads {threads} \
+            --paired {input.R1} {input.R2} \
+            --use-names \
+            --report {output.report} \
+            --output {output.kraken_output_file} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 6: Extract classified reads
+# ─────────────────────────────────────────────────────────────
+rule kraken_extract_reads:
+    input:
+        kraken_output = rules.kraken_classify.output.kraken_output_file,
+        R1            = rules.bbduk.output.cleaned_R1,
+        R2            = rules.bbduk.output.cleaned_R2
+    output:
+        classified_R1 = f"{base_path}/Combine/{{sample}}/kraken_classified/{{sample}}_classified_R1.fastq",
+        classified_R2 = f"{base_path}/Combine/{{sample}}/kraken_classified/{{sample}}_classified_R2.fastq"
+    params:
+        tools_path = kraken_tools_path,
+        env_path   = CONDA_ENVS["kraken2_env"]
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/kraken_extract.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.classified_R1}) $(dirname {log})
+        python {params.tools_path}/extract_kraken_reads.py \
+            -k {input.kraken_output} \
+            -s {input.R1} -s2 {input.R2} \
+            -o {output.classified_R1} -o2 {output.classified_R2} \
+            --fastq-output -t 0 --exclude &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 7: Adaptive SPAdes assembly
+# ─────────────────────────────────────────────────────────────
+rule spades:
+    input:
+        classified_R1 = rules.kraken_extract_reads.output.classified_R1,
+        classified_R2 = rules.kraken_extract_reads.output.classified_R2,
+        qc_zip        = f"{base_path}/Combine/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.zip"
+    output:
+        contigs = f"{base_path}/Combine/{{sample}}/spades_output/contigs.fasta"
+    params:
+        env_path = CONDA_ENVS["marine"]
+    threads: 8
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/spades.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.contigs}) $(dirname {log})
+
+        TMPDIR_QC=$(mktemp -d)
+        unzip -q {input.qc_zip} -d "$TMPDIR_QC"
+        QC_DATA=$(find "$TMPDIR_QC" -name "fastqc_data.txt" | head -1)
+
+        MEAN_Q=$(awk '/>>Per base sequence quality/,/>>END_MODULE/' "$QC_DATA" \
+                 | grep -v '^#' | grep -v '>>' \
+                 | awk '{{sum+=$2; n++}} END{{if(n>0) printf "%d", sum/n; else print 20}}')
+        READ_COUNT=$(awk '/Total Sequences/{{print $NF}}' "$QC_DATA")
+        READ_COUNT=${{READ_COUNT:-1000000}}
+        rm -rf "$TMPDIR_QC"
+
+        EXTRA_FLAGS=""
+        MEM=50
+
+        if [ "$MEAN_Q" -lt 20 ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --only-assembler"
+            echo "[SPAdes] Low quality (Q=$MEAN_Q): adding --only-assembler" | tee -a {log}
+        fi
+
+        if [ "$READ_COUNT" -le 5000000 ]; then
+            MEM=30
+            echo "[SPAdes] Low read count ($READ_COUNT): memory cap ${{MEM}}G" | tee -a {log}
+        fi
+
+        echo "[SPAdes] MeanQ=$MEAN_Q  ReadCount=$READ_COUNT  ExtraFlags=$EXTRA_FLAGS" | tee -a {log}
+
+        spades.py --careful --cov-cutoff auto \
+            -t {threads} -m $MEM \
+            $EXTRA_FLAGS \
+            -1 {input.classified_R1} -2 {input.classified_R2} \
+            -o $(dirname {output.contigs}) &>> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 8: Prokka
+# ─────────────────────────────────────────────────────────────
+rule prokka:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        gff = f"{base_path}/Combine/{{sample}}/prokka/annotated_genome.gff",
+        faa = f"{base_path}/Combine/{{sample}}/prokka/annotated_genome.faa"
+    params: env_path = CONDA_ENVS["prokka"]
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/prokka.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.gff}) $(dirname {log})
+        prokka --outdir $(dirname {output.gff}) --force \
+            --prefix annotated_genome --cpus {threads} \
+            {input.contigs} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 9: RepeatMasker
+# ─────────────────────────────────────────────────────────────
+rule repeatmasker:
+    input:  contigs = rules.spades.output.contigs
+    output: masked_fasta = f"{base_path}/Combine/{{sample}}/repeatmasker/contigs.masked.fasta"
+    params: env_path = CONDA_ENVS["marine"]
+    threads: 1
+    log: f"{base_path}/Combine/{{sample}}/logs/repeatmasker.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.masked_fasta}) $(dirname {log})
+        export LD_LIBRARY_PATH=/home/rashmi/local/libnsl/lib:$LD_LIBRARY_PATH
+        if [ ! -e /home/rashmi/local/libnsl/lib/libnsl.so.1 ]; then
+            ln -s /home/rashmi/local/libnsl/lib/libnsl.so.3 \
+                  /home/rashmi/local/libnsl/lib/libnsl.so.1
+        fi
+        RepeatMasker -species all -gff \
+            -dir $(dirname {output.masked_fasta}) {input.contigs} &> {log}
+        # RepeatMasker names output as <input>.masked — rename to expected path
+        MASKED_SRC="$(dirname {output.masked_fasta})/$(basename {input.contigs}).masked"
+        if [ -f "$MASKED_SRC" ] && [ "$MASKED_SRC" != "{output.masked_fasta}" ]; then
+            mv "$MASKED_SRC" {output.masked_fasta}
+        elif [ ! -f "{output.masked_fasta}" ]; then
+            # No repeats found — RepeatMasker does not create .masked; copy original
+            cp {input.contigs} {output.masked_fasta}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 10: InterProScan
+# FIX: strip stop-codon asterisks (*) that InterProScan rejects;
+#      use --disable-precalc to avoid lookup failures on HPC;
+#      removed -pa (requires Panther SFTool licence server).
+# ─────────────────────────────────────────────────────────────
+rule interproscan:
+    input:  faa = rules.prokka.output.faa
+    output:
+        tsv  = f"{base_path}/Combine/{{sample}}/interproscan/interproscan_results.tsv",
+        xml  = f"{base_path}/Combine/{{sample}}/interproscan/interproscan_results.xml",
+        gff3 = f"{base_path}/Combine/{{sample}}/interproscan/interproscan_results.gff3"
+    params:
+        outdir   = f"{base_path}/Combine/{{sample}}/interproscan",
+        env_path = CONDA_ENVS["interproscan"]
+    threads: 8
+    log: f"{base_path}/Combine/{{sample}}/logs/interproscan.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        # InterProScan cannot handle stop-codon '*' characters — strip them
+        CLEAN_FAA="{params.outdir}/proteins_clean.faa"
+        sed 's/\*//g' {input.faa} > "$CLEAN_FAA"
+
+        # Run InterProScan
+        # --disable-precalc  : skip pre-calculated match lookup (avoids network/licence issues on HPC)
+        # -pa removed        : pathway annotation requires a running Panther server
+        interproscan.sh \
+            -i "$CLEAN_FAA" \
+            -b {params.outdir}/interproscan_results \
+            -f TSV,XML,GFF3 \
+            -t p \
+            -appl Pfam,TIGRFAM,Gene3D,PANTHER,SMART,CDD,ProSiteProfiles,ProSitePatterns \
+            --disable-precalc \
+            -iprlookup -goterms \
+            --cpu {threads} &> {log}
+
+        rm -f "$CLEAN_FAA"
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 11: QUAST
+# ─────────────────────────────────────────────────────────────
+rule quast:
+    input:  contigs = rules.spades.output.contigs
+    output: report  = f"{base_path}/Combine/{{sample}}/quast/report.html"
+    params: env_path = CONDA_ENVS["quast"]
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/quast.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        quast -o $(dirname {output.report}) {input.contigs} --threads {threads} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 12: BUSCO
+# ─────────────────────────────────────────────────────────────
+rule busco:
+    input:  contigs = rules.spades.output.contigs
+    output: summary = f"{base_path}/Combine/{{sample}}/busco/{{sample}}_busco_output/short_summary.txt"
+    params:
+        outdir   = f"{base_path}/Combine/{{sample}}/busco",
+        env_path = CONDA_ENVS["busco"],
+        lineage  = BUSCO_LINEAGE
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/busco.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        busco -i {input.contigs} \
+              -o {wildcards.sample}_busco_output \
+              -m genome -l {params.lineage} \
+              --out_path {params.outdir} \
+              --offline -f --cpu {threads} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 13: CheckM
+# ─────────────────────────────────────────────────────────────
+rule checkm:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        summary    = f"{base_path}/Combine/{{sample}}/checkm_output/checkm.txt",
+        stats_file = f"{base_path}/Combine/{{sample}}/checkm_output/storage/bin_stats_ext.json"
+    params: env_path = CONDA_ENVS["checkm"]
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/checkm.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.summary}) $(dirname {log})
+        mkdir -p $(dirname {output.summary})/input
+        cp {input.contigs} $(dirname {output.summary})/input/
+        checkm lineage_wf -x fasta --threads {threads} \
+            $(dirname {output.summary})/input $(dirname {output.summary}) &> {log}
+        checkm qa $(dirname {output.summary})/lineage.ms $(dirname {output.summary}) \
+            -o 2 -f {output.summary} --tab_table
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 14: Prodigal
+# ─────────────────────────────────────────────────────────────
+rule prodigal:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        coords   = f"{base_path}/Combine/{{sample}}/prodigal/genes.coords",
+        proteins = f"{base_path}/Combine/{{sample}}/prodigal/proteins.faa",
+        genes    = f"{base_path}/Combine/{{sample}}/prodigal/genes.fna"
+    params: env_path = CONDA_ENVS["marine"]
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/prodigal.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.coords}) $(dirname {log})
+        prodigal -i {input.contigs} \
+            -o {output.coords} -a {output.proteins} -d {output.genes} \
+            -p single -q &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 15: ABRicate
+# FIX: added stderr redirect (2>>) so a tool warning/crash does
+#      not silently produce an empty file and fool Snakemake;
+#      added explicit exit-code guard so each db failure is logged.
+# ─────────────────────────────────────────────────────────────
+rule abricate:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        resfinder     = f"{base_path}/Combine/{{sample}}/abricate/abricate_resfinder.csv",
+        ncbi          = f"{base_path}/Combine/{{sample}}/abricate/abricate_ncbi.csv",
+        card          = f"{base_path}/Combine/{{sample}}/abricate/abricate_card.csv",
+        vfdb          = f"{base_path}/Combine/{{sample}}/abricate/abricate_vfdb.csv",
+        plasmidfinder = f"{base_path}/Combine/{{sample}}/abricate/abricate_plasmidfinder.csv"
+    params: env_path = CONDA_ENVS["abricate"]
+    threads: 4
+    log: f"{base_path}/Combine/{{sample}}/logs/abricate.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.resfinder}) $(dirname {log})
+
+        # Run each database independently; on failure write an empty
+        # header-only CSV so downstream rules are not blocked.
+        run_abricate() {{
+            local DB=$1 OUT=$2
+            echo "[ABRicate] Running db=$DB" | tee -a {log}
+            abricate --db "$DB" --minid 90 --mincov 80 --csv \
+                --threads {threads} {input.contigs} > "$OUT" 2>> {log} \
+                || {{ echo "[ABRicate] WARNING: db=$DB failed — writing empty output" | tee -a {log}
+                     echo "#FILE,SEQUENCE,START,END,STRAND,GENE,COVERAGE,COVERAGE_MAP,GAPS,%%COVERAGE,%%IDENTITY,DATABASE,ACCESSION,PRODUCT,RESISTANCE" > "$OUT"; }}
+        }}
+
+        run_abricate resfinder     {output.resfinder}
+        run_abricate ncbi          {output.ncbi}
+        run_abricate card          {output.card}
+        run_abricate vfdb          {output.vfdb}
+        run_abricate plasmidfinder {output.plasmidfinder}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 16: KofamScan
+# ─────────────────────────────────────────────────────────────
+rule kofamscan:
+    input:  proteins = rules.prokka.output.faa
+    output:
+        kofamscan_results = f"{base_path}/Combine/{{sample}}/kofamscan/kofamscan_results.txt",
+        kofamscan_tsv     = f"{base_path}/Combine/{{sample}}/kofamscan/kofamscan_results.tsv"
+    params:
+        profile  = KOFAM_PROFILE,
+        ko_list  = KOFAM_KO_LIST,
+        env_name = CONDA_ENVS["kofamscan"]
+    threads: 30
+    log: f"{base_path}/Combine/{{sample}}/logs/kofamscan.log"
+    shell:
+        """
+        source /opt/anaconda3/bin/activate
+        conda activate {params.env_name}
+        mkdir -p $(dirname {output.kofamscan_results}) $(dirname {log})
+        exec_annotation -f detail-tsv \
+            -o {output.kofamscan_tsv} \
+            -p {params.profile} -k {params.ko_list} \
+            --cpu {threads} {input.proteins} &> {log}
+        cp {output.kofamscan_tsv} {output.kofamscan_results}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 17: dbCAN
+# FIX: run_dbcan writes overview.txt only when ≥1 tool (HMMER /
+#      DIAMOND / dbCAN-sub) produces hits.  We now explicitly pass
+#      --tools hmmer,diamond,dbcansub so all three run, and we
+#      touch the file if it is absent so Snakemake is not blocked.
+# ─────────────────────────────────────────────────────────────
+rule dbcan:
+    input:  faa = rules.prokka.output.faa
+    output:
+        overview = f"{base_path}/Combine/{{sample}}/dbcan/overview.txt",
+        hmm_out  = f"{base_path}/Combine/{{sample}}/dbcan/hmmer.out"
+    params:
+        db_dir   = DBCAN_DB_DIR,
+        outdir   = f"{base_path}/Combine/{{sample}}/dbcan",
+        env_path = CONDA_ENVS["dbcan"]
+    threads: 8
+    log: f"{base_path}/Combine/{{sample}}/logs/dbcan.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        run_dbcan {input.faa} protein \
+            --out_dir {params.outdir} \
+            --db_dir  {params.db_dir} \
+            --tools   hmmer,diamond,dbcansub \
+            --dia_cpu {threads} \
+            --hmm_cpu {threads} \
+            --tf_cpu  {threads} &> {log}
+
+        # Guarantee overview.txt exists even when no CAZymes are found
+        if [ ! -f "{output.overview}" ]; then
+            echo "[dbCAN] overview.txt not produced — no CAZyme hits or tool error" | tee -a {log}
+            echo -e "HMMer\tDBCAN_sub\tDiamond\t#ofTools\tGene_ID" > {output.overview}
+        fi
+
+        # Guarantee hmmer.out exists
+        if [ ! -f "{output.hmm_out}" ]; then
+            touch {output.hmm_out}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 18: EggNOG-mapper
+# ─────────────────────────────────────────────────────────────
+rule eggnog_mapper:
+    input:  proteins = rules.prokka.output.faa
+    output:
+        annotations    = f"{base_path}/Combine/{{sample}}/emapper_results/annotations.emapper.annotations",
+        seed_orthologs = f"{base_path}/Combine/{{sample}}/emapper_results/annotations.emapper.seed_orthologs"
+    params:
+        outdir   = f"{base_path}/Combine/{{sample}}/emapper_results",
+        env_path = CONDA_ENVS["eggnog"]
+    threads: 1
+    log: f"{base_path}/Combine/{{sample}}/logs/eggnog_mapper.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p "{params.outdir}" "$(dirname {log})"
+        emapper.py -i {input.proteins} \
+            --output_dir {params.outdir} --output annotations \
+            --cpu {threads} --query_cover 0.5 -m diamond \
+            --seed_ortholog_evalue 0.01 --dbmem --sensmode fast \
+            --tax_scope 2 &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 19: CRISPRCasFinder
+# FIX: CRISPRCasFinder writes output into a timestamped sub-
+#      directory (Result_<timestamp>/) rather than directly into
+#      --out.  We find the TSV report dynamically after the run
+#      and copy it to the declared output path.
+# ─────────────────────────────────────────────────────────────
+rule crispr:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        crispr_output = f"{base_path}/Combine/{{sample}}/crispr_output/crispr_summary.txt"
+    params:
+        outdir   = f"{base_path}/Combine/{{sample}}/crispr_output",
+        env_path = CONDA_ENVS["crispr"]
+    threads: 2
+    log: f"{base_path}/Combine/{{sample}}/logs/crispr.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        CRISPRCasFinder.pl \
+            -in  {input.contigs} \
+            -out {params.outdir} \
+            -cas -keep \
+            -soFile {params.env_path}/sel392v2.so &> {log}
+
+        # CRISPRCasFinder writes into Result_<timestamp>/TSV/
+        # Locate the report regardless of timestamp directory name
+        TSV_REPORT=$(find {params.outdir} -name "Crisprs_REPORT.tsv" 2>/dev/null | head -1)
+
+        if [ -n "$TSV_REPORT" ] && [ -f "$TSV_REPORT" ]; then
+            cp "$TSV_REPORT" {output.crispr_output}
+            echo "[CRISPR] Report copied from $TSV_REPORT" | tee -a {log}
+        else
+            echo "[CRISPR] No CRISPR arrays found or tool failed — writing empty summary" | tee -a {log}
+            touch {output.crispr_output}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 20: antiSMASH
+# ─────────────────────────────────────────────────────────────
+rule antismash:
+    input:  contigs = rules.spades.output.contigs
+    output:
+        antismash_results = f"{base_path}/Combine/{{sample}}/antismash_results/knownclusterblast.txt",
+        index_html        = f"{base_path}/Combine/{{sample}}/antismash_results/index.html"
+    params:
+        antismash_db = ANTISMASH_DB,
+        output_dir   = f"{base_path}/Combine/{{sample}}/antismash_results",
+        env_path     = CONDA_ENVS["antismash"]
+    threads: 8
+    log: f"{base_path}/Combine/{{sample}}/logs/antismash.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        export ANTISMASH_DATABASES="{params.antismash_db}"
+        mkdir -p "{params.output_dir}" "$(dirname {log})"
+        PYTHONWARNINGS="ignore::BiopythonWarning" antismash {input.contigs} \
+            --output-dir {params.output_dir} \
+            --genefinding-tool prodigal --taxon bacteria \
+            --cb-knownclusters --cb-subclusters --cb-general \
+            --cc-mibig --fullhmmer --clusterhmmer \
+            --asf --pfam2go --enable-genefunctions --tigrfam --tfbs --rre --smcog-trees \
+            --enable-nrps-pks --enable-lanthipeptides --enable-lassopeptides \
+            --enable-thiopeptides --enable-terpene --enable-html \
+            --cpus {threads} &> {log}
+        [ -f {params.output_dir}/knownclusterblast.txt ] \
+            || touch {params.output_dir}/knownclusterblast.txt
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 21: HADEG
+# ─────────────────────────────────────────────────────────────
+rule hadeg:
+    input:
+        faa = rules.prokka.output.faa
+    output:
+        done_flag = f"{base_path}/Combine/{{sample}}/hadeg/hadeg_done.flag"
+    params:
+        hadeg_db      = HADEG_DB,
+        hadeg_rscript = HADEG_RSCRIPT,
+        outdir        = f"{base_path}/Combine/{{sample}}/hadeg",
+        env_path      = CONDA_ENVS["hadeg"]
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/hadeg.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        cd {params.outdir}
+        cp {input.faa} annotated_genome.faa
+
+        proteinortho annotated_genome.faa {params.hadeg_db} \
+            -identity=50 -conn=0.3 -project=Results_HADEG &> {log}
+
+        Rscript {params.hadeg_rscript} &>> {log}
+
+        touch {output.done_flag}
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 22: Barrnap — 16S rRNA extraction
+# ─────────────────────────────────────────────────────────────
+rule barrnap_16s:
+    input:
+        contigs = rules.spades.output.contigs
+    output:
+        gff   = f"{base_path}/Combine/{{sample}}/barrnap/contigs_16s.gff",
+        fasta = f"{base_path}/Combine/{{sample}}/barrnap/contigs_16s.fasta"
+    params:
+        env_path = CONDA_ENVS["barrnap"]
+    threads: 2
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/barrnap.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.gff}) $(dirname {log})
+
+        barrnap --kingdom bac --threads {threads} {input.contigs} \
+            2>> {log} | grep "16S_rRNA" > {output.gff} || true
+
+        if [ ! -s {output.gff} ]; then
+            echo "[Barrnap] No 16S rRNA genes detected in {wildcards.sample}" | tee -a {log}
+            touch {output.fasta}
+        else
+            bedtools getfasta \
+                -fi {input.contigs} \
+                -bed {output.gff} \
+                -fo {output.fasta} 2>> {log}
+            echo "[Barrnap] 16S sequences extracted: $(grep -c '>' {output.fasta})" | tee -a {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 23: FastANI — average nucleotide identity
+# FIX: FastANI requires a reference list file, not a directory.
+#      We write a one-line query list and use the NCBI reference
+#      genomes directory if available, otherwise skip gracefully.
+# ─────────────────────────────────────────────────────────────
+rule fastani:
+    input:
+        contigs = rules.spades.output.contigs
+    output:
+        ani_result = f"{base_path}/Combine/{{sample}}/fastani/fastani_results.txt"
+    params:
+        env_path  = CONDA_ENVS["fastani"],
+        outdir    = f"{base_path}/Combine/{{sample}}/fastani",
+        ref_dir   = "/home/ilsdatabank/fastani_refs"   # adjust to your reference genome directory
+    threads: 4
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/fastani.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        # Build query list (single assembly)
+        QUERY_LIST="{params.outdir}/query_list.txt"
+        echo "{input.contigs}" > "$QUERY_LIST"
+
+        # Build reference list from ref_dir if it exists
+        REF_LIST="{params.outdir}/ref_list.txt"
+        if [ -d "{params.ref_dir}" ]; then
+            find {params.ref_dir} -name "*.fna" -o -name "*.fasta" -o -name "*.fa" \
+                > "$REF_LIST" 2>/dev/null
+        fi
+
+        if [ ! -s "$REF_LIST" ]; then
+            echo "[FastANI] No reference genomes found in {params.ref_dir} — writing empty result" | tee -a {log}
+            echo "# FastANI skipped: no reference genomes available" > {output.ani_result}
+        else
+            fastANI \
+                --ql "$QUERY_LIST" \
+                --rl "$REF_LIST" \
+                -o {output.ani_result} \
+                -t {threads} &> {log}
+            # Guarantee file exists even if no hits
+            [ -f "{output.ani_result}" ] || touch {output.ani_result}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 24: Final report
+# ─────────────────────────────────────────────────────────────
+rule final_report:
+    input:
+        busco        = rules.busco.output.summary,
+        checkm       = rules.checkm.output.summary,
+        quast        = rules.quast.output.report,
+        prokka       = rules.prokka.output.gff,
+        interproscan = rules.interproscan.output.tsv,
+        kofamscan    = rules.kofamscan.output.kofamscan_results,
+        dbcan        = rules.dbcan.output.overview,
+        crispr       = rules.crispr.output.crispr_output,
+        antismash    = rules.antismash.output.antismash_results,
+        eggnog       = rules.eggnog_mapper.output.annotations,
+        repeatmasker = rules.repeatmasker.output.masked_fasta,
+        hadeg        = rules.hadeg.output.done_flag,
+        barrnap_16s  = rules.barrnap_16s.output.fasta,
+        fastani      = rules.fastani.output.ani_result
+    output:
+        report = f"{base_path}/Combine/{{sample}}/final_report.txt"
+    log:
+        f"{base_path}/Combine/{{sample}}/logs/final_report.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        {{
+          echo "Final Report for {wildcards.sample}";
+          echo "Generated on: $(date)";
+          echo "==========================================";
+          echo "";
+          echo "BUSCO Summary:";
+          [ -f {input.busco} ] && cat {input.busco} || echo "missing";
+          echo "";
+          echo "CheckM Summary:";
+          [ -f {input.checkm} ] && head -n 20 {input.checkm} || echo "missing";
+          echo "";
+          echo "QUAST Report: {input.quast}";
+          echo "";
+          echo "CRISPR Summary:";
+          [ -f {input.crispr} ] && head -n 20 {input.crispr} || echo "missing";
+          echo "";
+          echo "AntiSMASH (knownclusterblast):";
+          [ -f {input.antismash} ] && head -n 20 {input.antismash} || echo "missing";
+          echo "";
+          echo "RepeatMasker output created:";
+          [ -f {input.repeatmasker} ] && echo "Yes" || echo "No";
+          echo "";
+          echo "HADEG analysis:";
+          [ -f {input.hadeg} ] && echo "Completed — see $(dirname {input.hadeg})/" || echo "missing";
+          echo "";
+          echo "Barrnap 16S rRNA:";
+          if [ -s {input.barrnap_16s} ]; then
+              echo "Sequences found: $(grep -c '>' {input.barrnap_16s})";
+          else
+              echo "No 16S rRNA genes detected";
+          fi
+          echo "";
+          echo "FastANI results:";
+          [ -s {input.fastani} ] && cat {input.fastani} || echo "No ANI hits or skipped";
+        }} > {output.report} 2> {log}
+        """

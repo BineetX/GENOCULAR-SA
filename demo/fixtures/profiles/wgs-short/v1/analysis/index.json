@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "job_id": "demo-fixture",
+  "sample": "DEMO_ECOLI_SHORT",
+  "analysis_type": "wgs",
+  "mode": "short",
+  "generated_at": "2026-08-18T00:00:00Z",
+  "sections": [{"id": "wgs_quality", "title": "Genome completeness", "type": "plotly", "path": "analysis_plots/overview.json", "source": "demo", "order": 100, "renderer": "wgs_quality"}],
+  "generator_runs": []
+}

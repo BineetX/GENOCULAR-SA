@@ -1,0 +1,12 @@
+{
+  "sample_id": "DEMO_ECOLI_LONG",
+  "demo": true,
+  "yield_metrics": [
+    {"metric": "Number of reads", "raw": 185000, "cleaned": 161000},
+    {"metric": "Total bases (Gb)", "raw": 1.52, "cleaned": 1.38},
+    {"metric": "N50 (bp)", "raw": 14800, "cleaned": 16250}
+  ],
+  "mean_quality": {"raw": 11.8, "cleaned": 13.4},
+  "q_thresholds": [{"q_level": "Q10", "raw": 82.1, "cleaned": 91.7}],
+  "summary": {"assembly_type": "long-read", "illustrative": true}
+}

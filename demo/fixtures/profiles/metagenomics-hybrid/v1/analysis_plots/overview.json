@@ -1,0 +1,11 @@
+{
+  "sample_id": "DEMO_COMMUNITY_HYBRID",
+  "demo": true,
+  "plot_data": [
+    {"label": "MAG_001", "rel_abund": 34.2, "phylum": "Bacteroidota"},
+    {"label": "MAG_002", "rel_abund": 27.8, "phylum": "Proteobacteria"},
+    {"label": "MAG_003", "rel_abund": 21.6, "phylum": "Firmicutes"},
+    {"label": "Other MAGs", "rel_abund": 16.4, "phylum": "Other"}
+  ],
+  "summary": {"recovered_mags": 31, "dereplicated_mags": 23, "illustrative": true}
+}

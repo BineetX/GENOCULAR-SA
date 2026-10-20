@@ -1,0 +1,17 @@
+name: cdhit-env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - _libgcc_mutex=0.1=conda_forge
+  - _openmp_mutex=4.5=2_gnu
+  - cd-hit=4.8.1=h5ca1c30_13
+  - libgcc=15.2.0=he0feb66_16
+  - libgomp=15.2.0=he0feb66_16
+  - libstdcxx=15.2.0=h934c35e_16
+  - libzlib=1.3.1=hb9d3cd8_2
+  - subread=2.1.1=h577a1d6_0
+prefix: /home/rashmi/.conda/envs/cdhit-env

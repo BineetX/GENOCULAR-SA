@@ -1,0 +1,13 @@
+name: operams
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - perl=5.32
+  - perl-app-cpanminus
+  - r-base
+  - openjdk
+  - samtools
+  - mummer4
+  - libnsl
+  - libidn11

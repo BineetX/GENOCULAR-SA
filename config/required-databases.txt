@@ -1,0 +1,24 @@
+# Paths are relative to GENOCULAR_DB_ROOT. A trailing slash means directory.
+trimmomatic-0.39.jar
+adapters/TruSeq3-PE-2.fa
+kraken_bacteria_db/hash.k2d
+KrakenTools/kreport2mpa.py
+busco_bacteria_odb12/dataset.cfg
+kofamscan_db/ko_list
+kofamscan_db/profiles/
+antismash_db/
+dbcan_db/db/
+hadeg/HADEG_protein_database_231119.faa
+hadeg/HADEG.R
+cctyper/
+silva_16s_db.nsq
+kneaddata_db/hg_39.1.bt2
+metaphlan_db/
+kraken2_db/
+virsorter2_db/Done_all_setup
+gunc_db
+checkm2/CheckM2_database/uniref100.KO.1.dmnd
+gtdbtk/metadata/
+OPERA-MS/OPERA-MS.pl
+OPERA-MS/OPERA-MS-DB/
+Filtlong/bin/filtlong

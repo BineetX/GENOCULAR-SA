@@ -1,0 +1,11 @@
+{
+  "sample_id": "DEMO_COMMUNITY_SHORT",
+  "demo": true,
+  "top_species": [
+    {"name": "Bacteroides uniformis", "abund": 31.4, "phylum": "Bacteroidota"},
+    {"name": "Escherichia coli", "abund": 24.7, "phylum": "Proteobacteria"},
+    {"name": "Methanobrevibacter smithii", "abund": 12.8, "phylum": "Euryarchaeota"},
+    {"name": "Other", "abund": 31.1, "phylum": "Other"}
+  ],
+  "diversity_indices": {"shannon": 2.74, "simpson": 0.86, "illustrative": true}
+}

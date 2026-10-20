@@ -1,0 +1,1875 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║ HYBRID WGS PIPELINE · Short Reads + Long Reads ║
+║ Unicycler Assembler | Bacterial WGS | Full Annotation ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║ samples_hybrid.csv — REQUIRED columns: ║
+║ sample — sample name (e.g. SRR23239776) ║
+║ R1 — short-read R1 filename (e.g. SRR_R1.fastq.gz) ║
+║ R2 — short-read R2 filename (e.g. SRR_R2.fastq.gz) ║
+║ R0 — long-read filename (e.g. SRR_R0.fastq) ║
+║ OPTIONAL columns: ║
+║ read_type — ont_r9 | ont_r10 | ont_r10_sup | pacbio_clr ║
+║ genome_size — e.g. 3m | 2.5m | 4500k (default: 3m) ║
+╚══════════════════════════════════════════════════════════════════════════╝
+"""
+
+import pandas as pd
+import os
+import json
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+BASE_PATH = config.get("BASE", os.environ.get("BASE_PATH", "/data/genoverse"))
+OUTPUT_DIR = f"{BASE_PATH}/Hybrid"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Load samples CSV
+samples_df = pd.read_csv(f"{BASE_PATH}/samples_hybrid.csv")
+SAMPLES = samples_df["sample"].tolist()
+
+# ── Tool / database paths ────────────────────────────────────────────────────
+TRIMMOMATIC_JAR = os.environ.get("TRIMMOMATIC_JAR", "/dbs/trimmomatic-0.39.jar")
+ADAPTER_FILE = os.environ.get("ADAPTER_FILE", "/dbs/adapters/TruSeq3-PE-2.fa")
+KRAKEN_DB = os.environ.get("KRAKEN_DB_PATH", "/dbs/kraken_bacteria_db")
+KRAKEN_TOOLS = os.environ.get("KRAKEN_TOOLS_PATH", "/dbs/KrakenTools")
+BUSCO_LINEAGE = os.environ.get("BUSCO_LINEAGE", "/dbs/busco_bacteria_odb12")
+KOFAM_PROFILE = os.environ.get("KOFAM_PROFILE", "/dbs/kofamscan_db/profiles")
+KOFAM_KO_LIST = os.environ.get("KOFAM_KO_LIST", "/dbs/kofamscan_db/ko_list")
+ANTISMASH_DB = os.environ.get("ANTISMASH_DB", "/dbs/antismash_db")
+DBCAN_DB_DIR = os.environ.get("DBCAN_DB_DIR", "/dbs/dbcan_db/db")
+FILTLONG_BIN = os.environ.get("FILTLONG_BIN", "filtlong")
+HADEG_DB = os.environ.get("HADEG_DB", "/dbs/hadeg/HADEG_protein_database_231119.faa")
+HADEG_RSCRIPT = os.environ.get("HADEG_RSCRIPT", "/dbs/hadeg/HADEG.R")
+SILVA_BLAST_DB = os.environ.get("SILVA_BLAST_DB", "/dbs/silva_16s_db")
+
+def _find_env_dir(env_names, probe_bin):
+    for env_name in env_names:
+        p = Path(env_name)
+        if (p / "bin" / probe_bin).exists():
+            return str(p)
+
+    shared_prefix = Path(os.environ.get("SHARED_CONDA_PREFIX", "/data/genoverse/smk_envs_v4/shared"))
+    if shared_prefix.exists():
+        for d in sorted(shared_prefix.glob("*")):
+            if d.is_dir() and (d / "bin" / probe_bin).exists():
+                return str(d)
+
+    return ""
+
+# ── Conda environments ───────────────────────────────────────────────────────
+ENVS = {
+    "marine" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_MARINE", ""), "/opt/conda/envs/marine", "/home/rashmi/.conda/envs/marine"],
+        "seqtk",
+    ),
+    "fastqc" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_FASTQC", ""), "/opt/conda/envs/fastqc_env", "/home/rashmi/.conda/envs/fastqc_env"],
+        "fastqc",
+    ),
+    "cutadapt" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_CUTADAPT", ""), "/opt/conda/envs/cutadapt", "/home/rashmi/.conda/envs/cutadapt"],
+        "cutadapt",
+    ),
+    "nanoplot" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_NANOPLOT", ""), "/opt/conda/envs/nanoplot", "/home/rashmi/.conda/envs/nanoplot"],
+        "NanoPlot",
+    ),
+    "kraken2" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_KRAKEN2", ""), "/opt/conda/envs/kraken2_env", "/home/rashmi/.conda/envs/kraken2_env"],
+        "kraken2",
+    ),
+    "unicycler" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_UNICYCLER", ""), "/opt/conda/envs/unicycler", "/home/rashmi/.conda/envs/unicycler"],
+        "unicycler",
+    ),
+    "fastani" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_FASTANI", ""), "/opt/conda/envs/fastani_env", "/home/rashmi/.conda/envs/fastani_env"],
+        "fastANI",
+    ),
+    "ncbi" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_NCBI", ""), "/opt/conda/envs/ncbi_env", "/home/rashmi/.conda/envs/ncbi_env"],
+        "ncbi-genome-download",
+    ),
+    "prokka" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_PROKKA", ""), "/opt/conda/envs/prokka", "/home/rashmi/.conda/envs/prokka"],
+        "prokka",
+    ),
+    "interpro" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_INTERPROSCAN", ""), "/opt/conda/envs/interproscan_env", "/home/rashmi/.conda/envs/interproscan_env"],
+        "interproscan.sh",
+    ),
+    "quast" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_QUAST", ""), "/opt/conda/envs/quast", "/home/rashmi/.conda/envs/quast"],
+        "quast",
+    ),
+    "busco" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_BUSCO", ""), "/opt/conda/envs/busco", "/home/rashmi/.conda/envs/busco"],
+        "busco",
+    ),
+    "checkm" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_CHECKM", ""), "/opt/conda/envs/checkm", "/home/rashmi/.conda/envs/checkm"],
+        "checkm",
+    ),
+    "abricate" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_ABRICATE", ""), "/opt/conda/envs/abricate", "/home/rashmi/.conda/envs/abricate"],
+        "abricate",
+    ),
+    "kofamscan" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_KOFAMSCAN", ""), "/opt/conda/envs/kofamscan_env", "/home/rashmi/.conda/envs/kofamscan_env"],
+        "exec_annotation",
+    ),
+    "dbcan" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_DBCAN", ""), "/opt/conda/envs/dbcan", "/home/rashmi/.conda/envs/dbcan"],
+        "run_dbcan",
+    ),
+    "eggnog" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_EGGNOG", ""), "/opt/conda/envs/eggnog-mapper", "/home/rashmi/.conda/envs/eggnog-mapper"],
+        "emapper.py",
+    ),
+    "cctyper" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_CCTYPER", ""), "/opt/conda/envs/cctyper", "/home/rashmi/.conda/envs/cctyper"],
+        "cctyper",
+    ),
+    "antismash" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_ANTISMASH", ""), "/opt/conda/envs/antismash8", "/home/rashmi/.conda/envs/antismash8"],
+        "antismash",
+    ),
+    "hadeg" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_HADEG", ""), "/opt/conda/envs/hadeg", "/home/rashmi/.conda/envs/hadeg"],
+        "proteinortho",
+    ),
+    "barrnap" : _find_env_dir(
+        [os.environ.get("GENOVERSE_ENV_BARRNAP", ""), "/opt/conda/envs/barrnap", "/home/rashmi/.conda/envs/barrnap"],
+        "barrnap",
+    ),
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_col(wildcards, col):
+    val = samples_df.loc[samples_df["sample"] == wildcards.sample, col].values[0]
+    path = f"{BASE_PATH}/{val}"
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[ERROR] File not found for sample '{wildcards.sample}' (column '{col}'): {path}")
+    return path
+
+def get_long_reads(wildcards): return get_col(wildcards, "R0")
+def get_short_R1(wildcards): return get_col(wildcards, "R1")
+def get_short_R2(wildcards): return get_col(wildcards, "R2")
+
+def declared_read_type(wildcards):
+    if "read_type" in samples_df.columns:
+        rt = samples_df.loc[samples_df["sample"] == wildcards.sample, "read_type"].values
+        if len(rt) > 0 and pd.notna(rt[0]):
+            return str(rt[0]).strip()
+    return ""
+
+def declared_genome_size(wildcards):
+    if "genome_size" in samples_df.columns:
+        gs = samples_df.loc[samples_df["sample"] == wildcards.sample, "genome_size"].values
+        if len(gs) > 0 and pd.notna(gs[0]):
+            return str(gs[0]).strip()
+    return "3m"
+
+def genome_size_bp(gs_str):
+    gs = str(gs_str).strip().lower()
+    if gs.endswith("m"): return int(float(gs[:-1]) * 1_000_000)
+    if gs.endswith("k"): return int(float(gs[:-1]) * 1_000)
+    return int(gs)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RULE ALL
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        # Short-read QC
+        expand(f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.html", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R2_fastqc.html", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/fastqc_trimmed/{{sample}}_R1_clean_fastqc.html", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/fastqc_trimmed/{{sample}}_R2_clean_fastqc.html", sample=SAMPLES),
+        # Short-read processing
+        expand(f"{OUTPUT_DIR}/{{sample}}/trimmomatic/{{sample}}_R1_paired.fastq", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kraken_classified/{{sample}}_classified_R1.fastq", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kraken_classified/{{sample}}_classified_R2.fastq", sample=SAMPLES),
+        # Long-read QC
+        expand(f"{OUTPUT_DIR}/{{sample}}/nanoplot/NanoStats.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/decisions/pipeline_decision.json", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/filtered/{{sample}}_filtered.fastq", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kraken_long/kraken2_report.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kraken_long_classified/{{sample}}_long_classified.fastq", sample=SAMPLES),
+        # Hybrid assembly
+        expand(f"{OUTPUT_DIR}/{{sample}}/unicycler/assembly.fasta", sample=SAMPLES),
+        # Assembly QC
+        expand(f"{OUTPUT_DIR}/{{sample}}/quast/report.html", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/busco/{{sample}}_busco_output/short_summary.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/checkm_output/checkm.txt",                          sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/checkm_output/storage/bin_stats_ext.json",          sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/fastani/fastani_results.txt",                       sample=SAMPLES),
+        # Annotation
+        expand(f"{OUTPUT_DIR}/{{sample}}/prokka/annotated_genome.gff", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/prokka/annotated_genome.faa", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/prodigal/proteins.faa", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/interproscan/interproscan_results.tsv", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kofamscan/kofamscan_results.txt",                   sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/kofamscan/kofamscan_results.tsv",                   sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/dbcan/overview.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/emapper_results/annotations.emapper.annotations", sample=SAMPLES),
+        # AMR / virulence
+        expand(f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_card.csv", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_vfdb.csv", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_resfinder.csv", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_ncbi.csv", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_plasmidfinder.csv", sample=SAMPLES),
+        # Specialised
+        expand(f"{OUTPUT_DIR}/{{sample}}/crispr_output/crispr_summary.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/antismash_results/knownclusterblast.txt", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/repeatmasker/contigs.masked.fasta", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/hadeg/hadeg_done.flag", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/barrnap/contigs_16s.fasta", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/{{sample}}/blast_16s/blast_16s_results.txt", sample=SAMPLES),
+        # Final report
+        expand(f"{OUTPUT_DIR}/{{sample}}/final_report.txt", sample=SAMPLES),
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SHORT-READ PROCESSING
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 0a  —  FASTQC (pre-trimming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule fastqc_raw:
+    """FastQC quality assessment on raw short reads (before trimming)."""
+    input:
+        R1 = lambda wildcards: get_short_R1(wildcards),
+        R2 = lambda wildcards: get_short_R2(wildcards)
+    output:
+        html_R1 = f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.html",
+        html_R2 = f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R2_fastqc.html",
+        zip_R1  = f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R1_fastqc.zip",
+        zip_R2  = f"{OUTPUT_DIR}/{{sample}}/fastqc_raw/{{sample}}_R2_fastqc.zip"
+    params:
+        outdir   = f"{OUTPUT_DIR}/{{sample}}/fastqc_raw",
+        env_path = ENVS["fastqc"]
+    threads: 2
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/fastqc_raw.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        FASTQC_BIN="{params.env_path}/bin/fastqc"
+        if [ ! -x "$FASTQC_BIN" ]; then
+            FASTQC_BIN=$(which fastqc 2>/dev/null || true)
+        fi
+        if [ ! -x "$FASTQC_BIN" ]; then
+            echo "ERROR: fastqc not found" >&2
+            exit 1
+        fi
+
+        echo "[FastQC] Using: $FASTQC_BIN" | tee {log}
+        "$FASTQC_BIN" -t {threads} -o {params.outdir} {input.R1} {input.R2} &>> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 1  —  TRIMMOMATIC  (adapter + quality trimming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule trimmomatic:
+    """Remove Illumina adapters and low-quality bases with Trimmomatic."""
+    input:
+        R1 = lambda wildcards: get_short_R1(wildcards),
+        R2 = lambda wildcards: get_short_R2(wildcards)
+    output:
+        paired_R1   = f"{OUTPUT_DIR}/{{sample}}/trimmomatic/{{sample}}_R1_paired.fastq",
+        unpaired_R1 = f"{OUTPUT_DIR}/{{sample}}/trimmomatic/{{sample}}_R1_unpaired.fastq",
+        paired_R2   = f"{OUTPUT_DIR}/{{sample}}/trimmomatic/{{sample}}_R2_paired.fastq",
+        unpaired_R2 = f"{OUTPUT_DIR}/{{sample}}/trimmomatic/{{sample}}_R2_unpaired.fastq"
+    params:
+        jar         = TRIMMOMATIC_JAR,
+        adapters    = ADAPTER_FILE,
+        env_bin     = f"{ENVS['marine']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/trimmomatic.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.paired_R1}) $(dirname {log})
+        java -jar {params.jar} PE \
+            -phred33 -threads {threads} \
+            {input.R1} {input.R2} \
+            {output.paired_R1}   {output.unpaired_R1} \
+            {output.paired_R2}   {output.unpaired_R2} \
+            ILLUMINACLIP:{params.adapters}:2:30:10 \
+            LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:50 &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 2  —  CUTADAPT  (adapter trimming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule cutadapt:
+    """Further adapter trimming and quality filtering with Cutadapt."""
+    input:
+        R1 = rules.trimmomatic.output.paired_R1,
+        R2 = rules.trimmomatic.output.paired_R2
+    output:
+        R1 = f"{OUTPUT_DIR}/{{sample}}/cutadapt/{{sample}}_R1_trimmed.fastq",
+        R2 = f"{OUTPUT_DIR}/{{sample}}/cutadapt/{{sample}}_R2_trimmed.fastq"
+    params:
+        env_bin = f"{ENVS['cutadapt']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/cutadapt.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.R1}) $(dirname {log})
+        cutadapt -q 20 \
+            -o {output.R1} -p {output.R2} \
+            {input.R1} {input.R2} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 3  —  SEQTK  (quality trimming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule seqtk:
+    """Quality-trim reads with Seqtk trimfq."""
+    input:
+        R1 = rules.cutadapt.output.R1,
+        R2 = rules.cutadapt.output.R2
+    output:
+        R1 = f"{OUTPUT_DIR}/{{sample}}/seqtk/{{sample}}_R1_seqtk.fastq",
+        R2 = f"{OUTPUT_DIR}/{{sample}}/seqtk/{{sample}}_R2_seqtk.fastq"
+    params:
+        env_bin = f"{ENVS['marine']}/bin"
+    threads: 2
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/seqtk.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.R1}) $(dirname {log})
+        seqtk trimfq {input.R1} > {output.R1} 2>  {log}
+        seqtk trimfq {input.R2} > {output.R2} 2>> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 4  —  BBDUK  (contaminant / adapter cleaning)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule bbduk:
+    """Remove residual adapters and contaminants with BBDuk."""
+    input:
+        R1 = rules.seqtk.output.R1,
+        R2 = rules.seqtk.output.R2
+    output:
+        R1 = f"{OUTPUT_DIR}/{{sample}}/bbduk/{{sample}}_R1_clean.fastq",
+        R2 = f"{OUTPUT_DIR}/{{sample}}/bbduk/{{sample}}_R2_clean.fastq"
+    params:
+        env_bin = f"{ENVS['marine']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/bbduk.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.R1}) $(dirname {log})
+        bbduk.sh \
+            in={input.R1}    in2={input.R2} \
+            out={output.R1}  out2={output.R2} \
+            ref=adapters ktrim=r k=23 mink=11 hdist=1 tpe tbo &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 4b  —  FASTQC (post-trimming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule fastqc_trimmed:
+    """FastQC quality assessment on cleaned short reads (after BBDuk)."""
+    input:
+        R1 = rules.bbduk.output.R1,
+        R2 = rules.bbduk.output.R2
+    output:
+        html_R1 = f"{OUTPUT_DIR}/{{sample}}/fastqc_trimmed/{{sample}}_R1_clean_fastqc.html",
+        html_R2 = f"{OUTPUT_DIR}/{{sample}}/fastqc_trimmed/{{sample}}_R2_clean_fastqc.html"
+    params:
+        outdir   = f"{OUTPUT_DIR}/{{sample}}/fastqc_trimmed",
+        env_path = ENVS["fastqc"]
+    threads: 2
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/fastqc_trimmed.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        FASTQC_BIN="{params.env_path}/bin/fastqc"
+        if [ ! -x "$FASTQC_BIN" ]; then
+            FASTQC_BIN=$(which fastqc 2>/dev/null || true)
+        fi
+        if [ ! -x "$FASTQC_BIN" ]; then
+            echo "ERROR: fastqc not found" >&2; exit 1
+        fi
+
+        "$FASTQC_BIN" -t {threads} -o {params.outdir} {input.R1} {input.R2} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 5  —  KRAKEN2  (short-read taxonomic classification)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule kraken_classify_short:
+    """Classify short reads with Kraken2 (paired-end mode)."""
+    input:
+        R1 = rules.bbduk.output.R1,
+        R2 = rules.bbduk.output.R2
+    output:
+        report = f"{OUTPUT_DIR}/{{sample}}/kraken_short/kraken2_report.txt",
+        kout   = f"{OUTPUT_DIR}/{{sample}}/kraken_short/kraken2_output.txt"
+    params:
+        db_path = KRAKEN_DB,
+        env_bin = f"{ENVS['kraken2']}/bin"
+    threads: 8
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/kraken_classify_short.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        kraken2 \
+            --db      {params.db_path} \
+            --threads {threads} \
+            --paired  {input.R1} {input.R2} \
+            --use-names \
+            --report  {output.report} \
+            --output  {output.kout} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SR STEP 6  —  EXTRACT BACTERIAL SHORT READS
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule kraken_extract_short:
+    """Extract bacterial reads from short-read Kraken2 output."""
+    input:
+        kout = rules.kraken_classify_short.output.kout,
+        R1   = rules.bbduk.output.R1,
+        R2   = rules.bbduk.output.R2
+    output:
+        R1 = f"{OUTPUT_DIR}/{{sample}}/kraken_classified/{{sample}}_classified_R1.fastq",
+        R2 = f"{OUTPUT_DIR}/{{sample}}/kraken_classified/{{sample}}_classified_R2.fastq"
+    params:
+        tools_path = KRAKEN_TOOLS,
+        env_bin    = f"{ENVS['kraken2']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/kraken_extract_short.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.R1}) $(dirname {log})
+        python {params.tools_path}/extract_kraken_reads.py \
+            -k {input.kout} \
+            -s  {input.R1} \
+            -s2 {input.R2} \
+            -o  {output.R1} \
+            -o2 {output.R2} \
+            --fastq-output -t 0 --exclude &> {log}
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LONG-READ PROCESSING
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LR STEP 1  —  NANOPLOT  (read QC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule nanoplot:
+    """Run NanoPlot to generate long-read quality statistics and plots."""
+    input:
+        reads = lambda wildcards: get_long_reads(wildcards)
+    output:
+        stats = f"{OUTPUT_DIR}/{{sample}}/nanoplot/NanoStats.txt",
+        html  = f"{OUTPUT_DIR}/{{sample}}/nanoplot/NanoPlot-report.html"
+    params:
+        outdir  = f"{OUTPUT_DIR}/{{sample}}/nanoplot",
+        env_bin = f"{ENVS['nanoplot']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/nanoplot.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        NanoPlot \
+            --fastq  {input.reads} \
+            --outdir {params.outdir} \
+            --plots hex dot \
+            --N50 --loglength \
+            --threads {threads} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LR STEP 2  —  PIPELINE DECISION ENGINE
+#
+#  Parses NanoStats.txt and computes:
+#   A) Read-type auto-detection (ONT vs CLR)
+#   B) Coverage  = total_bases / genome_size_bp
+#   C) Coverage-tiered Filtlong thresholds
+#   D) Optional NanoFilt pre-pass (when mean Q < 7)
+#  Writes pipeline_decision.json + decision_summary.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule pipeline_decision:
+    """Compute all long-read pipeline parameters from NanoStats and write JSON."""
+    input:
+        stats = rules.nanoplot.output.stats
+    output:
+        json_out = f"{OUTPUT_DIR}/{{sample}}/decisions/pipeline_decision.json",
+        log_out  = f"{OUTPUT_DIR}/{{sample}}/decisions/decision_summary.txt"
+    params:
+        declared_rt = lambda wildcards: declared_read_type(wildcards),
+        genome_size = lambda wildcards: declared_genome_size(wildcards)
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/pipeline_decision.log"
+    run:
+        import json
+
+        # ── Parse NanoStats.txt ──────────────────────────────────────────────
+        ns = {}
+        with open(input.stats) as fh:
+            for line in fh:
+                if ":" in line:
+                    k, v = line.strip().split(":", 1)
+                    k = k.strip().lower().replace(" ", "_")
+                    v = v.strip().replace(",", "")
+                    try:    ns[k] = float(v)
+                    except: ns[k] = v
+
+        mean_q      = float(ns.get("mean_read_quality",  ns.get("mean_quality",   8.0)))
+        median_len  = float(ns.get("median_read_length", ns.get("median_length", 5000.0)))
+        n50         = float(ns.get("read_n50",           ns.get("n50",          5000.0)))
+        total_reads = float(ns.get("number_of_reads",    ns.get("reads",       50000.0)))
+        total_bases = float(ns.get("total_bases",        total_reads * median_len))
+
+        gs_str   = params.genome_size
+        gs_bp    = genome_size_bp(gs_str)
+        coverage = round(total_bases / gs_bp, 1)
+        declared = params.declared_rt
+
+        # ── A) Auto-detect read type ─────────────────────────────────────────
+        if   mean_q >= 12 and median_len >= 5000: auto_type = "ont_r10"
+        elif mean_q >= 10 and median_len >= 4000: auto_type = "ont_r10"
+        elif mean_q >= 7  and median_len >= 3000: auto_type = "ont_r9"
+        else:                                     auto_type = "pacbio_clr"
+
+        valid_types = {"ont_r9", "ont_r10", "ont_r10_sup", "pacbio_clr"}
+        conflict    = ""
+        if declared in valid_types:
+            if declared == "pacbio_clr" and mean_q > 12:
+                conflict   = f"WARNING: Declared 'pacbio_clr' but mean Q={mean_q:.1f} looks like ONT. Auto-overriding to {auto_type}."
+                final_type = auto_type
+            elif declared in {"ont_r9","ont_r10","ont_r10_sup"} and mean_q < 5:
+                conflict   = f"WARNING: Declared ONT but mean Q={mean_q:.1f} is very low. Auto-overriding to pacbio_clr."
+                final_type = "pacbio_clr"
+            else:
+                final_type = declared
+        else:
+            final_type = auto_type
+
+        is_ont = final_type in {"ont_r9", "ont_r10", "ont_r10_sup"}
+        is_clr = final_type == "pacbio_clr"
+
+        # ── B) Coverage tiers → Filtlong parameters ──────────────────────────
+        warnings = []
+        if coverage < 20:
+            filtlong_min_len, filtlong_keep_pct = 500,  99
+            coverage_tier = "ultra-light (<20x)"
+            warnings.append(f"Very low coverage ({coverage:.1f}x). Ultra-light filtering applied.")
+        elif coverage < 50:
+            filtlong_min_len, filtlong_keep_pct = 1000, 95
+            coverage_tier = "light (<50x)"
+        elif coverage <= 150:
+            filtlong_min_len, filtlong_keep_pct = 1000, 90
+            coverage_tier = "moderate (50–150x)"
+        else:
+            filtlong_min_len, filtlong_keep_pct = 2000, 80
+            coverage_tier = "strict (>150x)"
+
+        if n50 < 2000 and filtlong_min_len > 500:
+            filtlong_min_len = 500
+            warnings.append(f"Read N50 ({n50:.0f} bp) < 2000. Filtlong min_length relaxed to 500.")
+        if total_reads < 5000:
+            filtlong_min_len, filtlong_keep_pct = 500, 99
+            warnings.append(f"Only {int(total_reads):,} reads. Maximum retention applied.")
+
+        # ── C) NanoFilt pre-pass ─────────────────────────────────────────────
+        use_nanofilt = mean_q < 7.0
+        if mean_q < 5.5:
+            nanofilt_q      = 4
+            nanofilt_reason = f"Mean Q ({mean_q:.1f}) < 5.5 — NanoFilt -q 4 applied."
+        elif mean_q < 7.0:
+            nanofilt_q      = 5
+            nanofilt_reason = f"Mean Q ({mean_q:.1f}) < 7.0 — NanoFilt -q 5 applied."
+        else:
+            nanofilt_q      = 5
+            nanofilt_reason = f"Mean Q ({mean_q:.1f}) ≥ 7.0 — NanoFilt not needed."
+        nanofilt_len = 500
+
+        # ── Write JSON ───────────────────────────────────────────────────────
+        os.makedirs(os.path.dirname(output.json_out), exist_ok=True)
+        decision = {
+            "sample"            : wildcards.sample,
+            "genome_size_str"   : gs_str,
+            "genome_size_bp"    : gs_bp,
+            "mean_q"            : round(mean_q, 2),
+            "median_len"        : int(median_len),
+            "n50"               : int(n50),
+            "total_reads"       : int(total_reads),
+            "total_bases"       : int(total_bases),
+            "coverage_x"        : coverage,
+            "coverage_tier"     : coverage_tier,
+            "declared_type"     : declared,
+            "auto_type"         : auto_type,
+            "final_type"        : final_type,
+            "conflict"          : conflict,
+            "is_ont"            : is_ont,
+            "is_clr"            : is_clr,
+            "use_nanofilt"      : use_nanofilt,
+            "nanofilt_q"        : nanofilt_q,
+            "nanofilt_len"      : nanofilt_len,
+            "nanofilt_reason"   : nanofilt_reason,
+            "filtlong_min_len"  : filtlong_min_len,
+            "filtlong_keep_pct" : filtlong_keep_pct,
+            "warnings"          : warnings,
+        }
+        with open(output.json_out, "w") as fh:
+            json.dump(decision, fh, indent=2)
+
+        # ── Human-readable summary ───────────────────────────────────────────
+        sep = "─" * 60
+        with open(output.log_out, "w") as fh:
+            fh.write(f"{'═'*60}\n  PIPELINE DECISION — {wildcards.sample}\n{'═'*60}\n\n")
+            fh.write(f"  Read statistics\n  {sep}\n")
+            fh.write(f"    Mean Q        : {mean_q:.2f}\n")
+            fh.write(f"    Median length : {int(median_len):,} bp\n")
+            fh.write(f"    Read N50      : {int(n50):,} bp\n")
+            fh.write(f"    Total reads   : {int(total_reads):,}\n")
+            fh.write(f"    Total bases   : {int(total_bases):,}\n\n")
+            fh.write(f"  Coverage\n  {sep}\n")
+            fh.write(f"    Genome size   : {gs_str}  ({gs_bp:,} bp)\n")
+            fh.write(f"    Estimated Cx  : {coverage:.1f}x  [{coverage_tier}]\n\n")
+            fh.write(f"  Read type\n  {sep}\n")
+            fh.write(f"    Declared      : {declared or '(not specified — auto-detecting)'}\n")
+            fh.write(f"    Auto-detected : {auto_type}\n")
+            fh.write(f"    FINAL         : {final_type}\n")
+            if conflict: fh.write(f"    ⚠  {conflict}\n")
+            fh.write(f"\n  Filtering\n  {sep}\n")
+            fh.write(f"    NanoFilt      : {'YES — ' if use_nanofilt else 'NO  — '}{nanofilt_reason}\n")
+            if use_nanofilt: fh.write(f"      Parameters  : -q {nanofilt_q}  -l {nanofilt_len}\n")
+            fh.write(f"    Filtlong      : --min_length {filtlong_min_len}  --keep_percent {filtlong_keep_pct}\n")
+            fh.write(f"\n  Assembler\n  {sep}\n")
+            fh.write(f"    Unicycler (hybrid): short R1/R2 + long reads\n")
+            if warnings:
+                fh.write(f"\n  Warnings\n  {sep}\n")
+                for w in warnings: fh.write(f"    [WARN] {w}\n")
+
+        with open(log[0], "w") as lf:
+            lf.write(f"Decision done. Type: {final_type}  Coverage: {coverage:.1f}x\n")
+            if conflict: lf.write(conflict + "\n")
+            for w in warnings: lf.write(f"[WARN] {w}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LR STEP 3  —  ADAPTIVE FILTERING  (NanoFilt + Filtlong)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule adaptive_filter:
+    """Filter long reads: optional NanoFilt pre-pass, then Filtlong."""
+    input:
+        reads    = lambda wildcards: get_long_reads(wildcards),
+        dec_json = rules.pipeline_decision.output.json_out
+    output:
+        filtered = f"{OUTPUT_DIR}/{{sample}}/filtered/{{sample}}_filtered.fastq"
+    params:
+        nanoplot_bin = f"{ENVS['nanoplot']}/bin",
+        filtlong_bin = FILTLONG_BIN
+    threads: 2
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/adaptive_filter.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.filtered}) $(dirname {log})
+
+        USE_NF=$(python3 -c "import json; d=json.load(open('{input.dec_json}')); print(str(d['use_nanofilt']).lower())")
+        NF_Q=$(python3   -c "import json; d=json.load(open('{input.dec_json}')); print(d['nanofilt_q'])")
+        NF_L=$(python3   -c "import json; d=json.load(open('{input.dec_json}')); print(d['nanofilt_len'])")
+        FL_L=$(python3   -c "import json; d=json.load(open('{input.dec_json}')); print(d['filtlong_min_len'])")
+        FL_P=$(python3   -c "import json; d=json.load(open('{input.dec_json}')); print(d['filtlong_keep_pct'])")
+        TIER=$(python3   -c "import json; d=json.load(open('{input.dec_json}')); print(d['coverage_tier'])")
+
+        echo "─────────────────────────────────────────────────"  >> {log}
+        echo "  Long-read filtering  —  {wildcards.sample}"       >> {log}
+        echo "  Coverage tier : $TIER"                            >> {log}
+        echo "  NanoFilt      : $USE_NF  (-q $NF_Q  -l $NF_L)"   >> {log}
+        echo "  Filtlong      : min_length=$FL_L  keep%=$FL_P"    >> {log}
+        echo "─────────────────────────────────────────────────"  >> {log}
+
+        TMP="{output.filtered}.nanofilt_tmp"
+        if [ "$USE_NF" = "true" ]; then
+            echo "[filter] NanoFilt pre-pass (mean Q < 7)" >> {log}
+            export PATH={params.nanoplot_bin}:$PATH
+            NanoFilt -q $NF_Q -l $NF_L {input.reads} > "$TMP" 2>> {log}
+            echo "[filter] Reads after NanoFilt: $(grep -c '^@' $TMP 2>/dev/null || echo 0)" >> {log}
+            FILTER_INPUT="$TMP"
+        else
+            echo "[filter] NanoFilt skipped (mean Q ≥ 7)" >> {log}
+            FILTER_INPUT="{input.reads}"
+        fi
+
+        echo "[filter] Running Filtlong" >> {log}
+        {params.filtlong_bin} \
+            --min_length   $FL_L \
+            --keep_percent $FL_P \
+            "$FILTER_INPUT" > {output.filtered} 2>> {log}
+
+        rm -f "$TMP"
+
+        FINAL=$(grep -c "^@" {output.filtered} 2>/dev/null || echo 0)
+        echo "[filter] Final read count : $FINAL" >> {log}
+        if [ "$FINAL" -lt 500 ]; then
+            echo "[filter] CRITICAL: only $FINAL reads remain — check coverage and read_type." >> {log}
+        elif [ "$FINAL" -lt 5000 ]; then
+            echo "[filter] WARNING: only $FINAL reads remain — assembly may be incomplete." >> {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LR STEP 4  —  KRAKEN2  (long-read taxonomic classification)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule kraken_classify_long:
+    """Classify filtered long reads with Kraken2 (--long-reads mode)."""
+    input:
+        reads = rules.adaptive_filter.output.filtered
+    output:
+        report = f"{OUTPUT_DIR}/{{sample}}/kraken_long/kraken2_report.txt",
+        kout   = f"{OUTPUT_DIR}/{{sample}}/kraken_long/kraken2_output.txt"
+    params:
+        db_path = KRAKEN_DB,
+        env_bin = f"{ENVS['kraken2']}/bin"
+    threads: 8
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/kraken_classify_long.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        kraken2 \
+            --db      {params.db_path} \
+            --threads {threads} \
+            --long-reads \
+            --use-names \
+            --report  {output.report} \
+            --output  {output.kout} \
+            {input.reads} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LR STEP 5  —  EXTRACT BACTERIAL LONG READS
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule kraken_extract_long:
+    """Extract bacterial long reads from Kraken2 output."""
+    input:
+        kout  = rules.kraken_classify_long.output.kout,
+        reads = rules.adaptive_filter.output.filtered
+    output:
+        classified = f"{OUTPUT_DIR}/{{sample}}/kraken_long_classified/{{sample}}_long_classified.fastq"
+    params:
+        tools_path = KRAKEN_TOOLS,
+        env_bin    = f"{ENVS['kraken2']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/kraken_extract_long.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.classified}) $(dirname {log})
+        python {params.tools_path}/extract_kraken_reads.py \
+            -k {input.kout} \
+            -s {input.reads} \
+            -o {output.classified} \
+            --fastq-output -t 0 --exclude &> {log}
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  HYBRID ASSEMBLY
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ASSEMBLY  —  UNICYCLER  (hybrid mode)
+#
+#  Unicycler uses:
+#    -1  cleaned + Kraken-filtered short R1
+#    -2  cleaned + Kraken-filtered short R2
+#    -l  filtered + Kraken-classified long reads
+#
+#  Mode is set to "normal" by default; change to "bold" if assembly is
+#  fragmented or "conservative" if accuracy is critical.
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule unicycler:
+    """
+    Hybrid assembly with Unicycler.
+    Short reads anchor accuracy; long reads bridge repeats and close chromosomes.
+    Output: assembly.fasta (complete or near-complete circular chromosomes).
+    """
+    input:
+        short_R1   = rules.kraken_extract_short.output.R1,
+        short_R2   = rules.kraken_extract_short.output.R2,
+        long_reads = rules.kraken_extract_long.output.classified
+    output:
+        assembly = f"{OUTPUT_DIR}/{{sample}}/unicycler/assembly.fasta",
+        gfa      = f"{OUTPUT_DIR}/{{sample}}/unicycler/assembly.gfa"
+    params:
+        outdir  = f"{OUTPUT_DIR}/{{sample}}/unicycler",
+        env_bin = f"{ENVS['unicycler']}/bin",
+        mode    = "normal"    # options: conservative | normal | bold
+    threads: 16
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/unicycler.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        echo "─────────────────────────────────────────────────" >> {log}
+        echo "  Unicycler hybrid assembly — {wildcards.sample}"  >> {log}
+        echo "  Mode    : {params.mode}"                         >> {log}
+        echo "  Threads : {threads}"                             >> {log}
+        echo "─────────────────────────────────────────────────" >> {log}
+
+        unicycler \
+            -1 {input.short_R1} \
+            -2 {input.short_R2} \
+            -l {input.long_reads} \
+            --mode   {params.mode} \
+            --out    {params.outdir} \
+            --threads {threads} &>> {log}
+
+        echo "[unicycler] Contigs: $(grep -c '^>' {output.assembly})" >> {log}
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ASSEMBLY QC
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QC STEP 1  —  QUAST
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule quast:
+    """Evaluate Unicycler assembly quality with QUAST."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        report = f"{OUTPUT_DIR}/{{sample}}/quast/report.html"
+    params:
+        outdir  = f"{OUTPUT_DIR}/{{sample}}/quast",
+        env_bin = f"{ENVS['quast']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/quast.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        quast \
+            --output-dir {params.outdir} \
+            --threads    {threads} \
+            --circo \
+            --min-contig 500 \
+            {input.contigs} &> {log}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QC STEP 2  —  BUSCO
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule busco:
+    """Assess genome completeness with BUSCO (bacteria_odb12)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        summary = f"{OUTPUT_DIR}/{{sample}}/busco/{{sample}}_busco_output/short_summary.txt"
+    params:
+        outdir  = f"{OUTPUT_DIR}/{{sample}}/busco",
+        env_bin = f"{ENVS['busco']}/bin",
+        lineage = BUSCO_LINEAGE
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/busco.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        busco \
+            -i {input.contigs} \
+            -o {wildcards.sample}_busco_output \
+            -m genome \
+            -l {params.lineage} \
+            --out_path {params.outdir} \
+            --offline -f \
+            --cpu {threads} &> {log}
+
+        # BUSCO 5+ writes short_summary.specific.<lineage>.<n>.txt
+        # NOT short_summary.txt — find and copy to the declared output path
+        BUSCO_DIR="{params.outdir}/{wildcards.sample}_busco_output"
+        ACTUAL=$(find "$BUSCO_DIR" -maxdepth 1 -name "short_summary*.txt" 2>/dev/null | head -1)
+        if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "{output.summary}" ]; then
+            cp "$ACTUAL" {output.summary}
+        fi
+        [ -f {output.summary} ] || touch {output.summary}
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QC STEP 3  —  CHECKM  (v1 — matches short-read pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule checkm:
+    """Estimate completeness and contamination with CheckM (lineage_wf)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        summary    = f"{OUTPUT_DIR}/{{sample}}/checkm_output/checkm.txt",
+        stats_file = f"{OUTPUT_DIR}/{{sample}}/checkm_output/storage/bin_stats_ext.json"
+    params:
+        env_path = ENVS["checkm"]
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/checkm.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.summary}) $(dirname {log})
+        mkdir -p $(dirname {output.summary})/input
+        cp {input.contigs} $(dirname {output.summary})/input/
+        checkm lineage_wf -x fasta --threads {threads} \
+            $(dirname {output.summary})/input $(dirname {output.summary}) &> {log}
+        checkm qa $(dirname {output.summary})/lineage.ms $(dirname {output.summary}) \
+            -o 2 -f {output.summary} --tab_table
+        """
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ANNOTATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+rule prokka:
+    """Structural annotation with Prokka (GFF + FAA)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        gff = f"{OUTPUT_DIR}/{{sample}}/prokka/annotated_genome.gff",
+        faa = f"{OUTPUT_DIR}/{{sample}}/prokka/annotated_genome.faa"
+    params:
+        outdir  = f"{OUTPUT_DIR}/{{sample}}/prokka",
+        env_bin = f"{ENVS['prokka']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/prokka.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        prokka \
+            --outdir {params.outdir} \
+            --prefix annotated_genome \
+            --cpus   {threads} \
+            --force  {input.contigs} &> {log}
+        """
+
+
+rule prodigal:
+    """Ab initio gene prediction with Prodigal."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        coords   = f"{OUTPUT_DIR}/{{sample}}/prodigal/genes.coords",
+        proteins = f"{OUTPUT_DIR}/{{sample}}/prodigal/proteins.faa",
+        genes    = f"{OUTPUT_DIR}/{{sample}}/prodigal/genes.fna"
+    params:
+        env_bin = f"{ENVS['marine']}/bin"
+    threads: 1
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/prodigal.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.coords}) $(dirname {log})
+        prodigal \
+            -i {input.contigs} \
+            -o {output.coords} \
+            -a {output.proteins} \
+            -d {output.genes} \
+            -p single -q &> {log}
+        """
+
+rule interproscan:
+    input:  faa = rules.prokka.output.faa
+    output:
+        tsv  = f"{OUTPUT_DIR}/{{sample}}/interproscan/interproscan_results.tsv",
+        xml  = f"{OUTPUT_DIR}/{{sample}}/interproscan/interproscan_results.xml",
+        gff3 = f"{OUTPUT_DIR}/{{sample}}/interproscan/interproscan_results.gff3"
+    params:
+        outdir   = f"{OUTPUT_DIR}/{{sample}}/interproscan",
+        env_path = ENVS["interpro"]
+    threads: 8
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/interproscan.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        # FIX: InterProScan is Java-based. Without adequate heap and a writable
+        # temp directory it crashes silently. Set both explicitly.
+        export JAVA_OPTS="-Xmx8g -Xms2g"
+        export _JAVA_OPTIONS="-Djava.io.tmpdir={params.outdir}/tmp"
+        IPRTMP="{params.outdir}/tmp"
+        mkdir -p "$IPRTMP"
+
+        echo "[InterProScan] Started for {wildcards.sample}" > {log}
+        echo "[InterProScan] Input FAA: {input.faa}" >> {log}
+        echo "[InterProScan] Sequences: $(grep -c '^>' {input.faa} 2>/dev/null || echo 0)" >> {log}
+        echo "[InterProScan] JAVA_OPTS: $JAVA_OPTS" >> {log}
+        echo "[InterProScan] Tmp dir  : $IPRTMP" >> {log}
+        echo "[InterProScan] interproscan.sh: $(which interproscan.sh 2>/dev/null || echo NOT FOUND)" >> {log}
+
+        # InterProScan cannot handle stop-codon '*' characters — strip them
+        CLEAN_FAA="{params.outdir}/proteins_clean.faa"
+        sed 's/*//g' {input.faa} > "$CLEAN_FAA"
+        echo "[InterProScan] Cleaned FAA written: $CLEAN_FAA" >> {log}
+
+        interproscan.sh \
+            -i "$CLEAN_FAA" \
+            -b {params.outdir}/interproscan_results \
+            -f TSV,XML,GFF3 \
+            -t p \
+            -appl Pfam,TIGRFAM,Gene3D,PANTHER,SMART,CDD,ProSiteProfiles,ProSitePatterns \
+            --disable-precalc \
+            -iprlookup -goterms \
+            -T "$IPRTMP" \
+            --cpu {threads} >> {log} 2>&1
+
+        ISTAT=$?
+        echo "[InterProScan] Exit code: $ISTAT" >> {log}
+
+        # FIX: check output BEFORE deleting clean FAA so we can diagnose failures
+        [ -f {output.tsv}  ] || {{ echo "[InterProScan] No TSV — creating empty file"  >> {log}; touch {output.tsv};  }}
+        [ -f {output.xml}  ] || {{ echo "[InterProScan] No XML — creating empty file"  >> {log}; touch {output.xml};  }}
+        [ -f {output.gff3} ] || {{ echo "[InterProScan] No GFF3 — creating empty file" >> {log}; touch {output.gff3}; }}
+
+        rm -f "$CLEAN_FAA"
+        rm -rf "$IPRTMP"
+
+        echo "[InterProScan] Done." >> {log}
+        """
+
+
+rule kofamscan:
+    input:
+        proteins = rules.prokka.output.faa
+    output:
+        kofamscan_results = f"{OUTPUT_DIR}/{{sample}}/kofamscan/kofamscan_results.txt",
+        kofamscan_tsv     = f"{OUTPUT_DIR}/{{sample}}/kofamscan/kofamscan_results.tsv"
+    params:
+        profile  = KOFAM_PROFILE,
+        ko_list  = KOFAM_KO_LIST,
+        env_bin  = f"{ENVS['kofamscan']}/bin"   # FIX: full path
+    threads: 30
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/kofamscan.log"
+    shell:
+        """
+        # FIX: use export PATH like all other rules — conda activate is broken in Snakemake
+        export PATH={params.env_bin}:$PATH
+
+        # FIX: KofamScan exec_annotation is a Ruby script — Ruby gems must be
+        # resolvable. Set GEM_PATH to the env's gem directory.
+        export GEM_HOME={params.env_bin}/../lib/ruby/gems
+        export GEM_PATH=$GEM_HOME
+
+        mkdir -p $(dirname {output.kofamscan_results}) $(dirname {log})
+
+        # FIX: dedicated tmp dir for large HMM intermediate files
+        KOFAM_TMP=$(dirname {output.kofamscan_results})/tmp
+        mkdir -p "$KOFAM_TMP"
+
+        echo "[KofamScan] Started for {wildcards.sample}" > {log}
+        echo "[KofamScan] Binary path : {params.env_bin}" >> {log}
+        echo "[KofamScan] Profile     : {params.profile}"  >> {log}
+        echo "[KofamScan] KO list     : {params.ko_list}"  >> {log}
+        echo "[KofamScan] Input       : {input.proteins}"  >> {log}
+        echo "[KofamScan] Sequences   : $(grep -c '^>' {input.proteins} 2>/dev/null || echo 0)" >> {log}
+        echo "[KofamScan] exec_annotation: $(which exec_annotation 2>/dev/null || echo NOT FOUND)" >> {log}
+        echo "[KofamScan] ruby        : $(which ruby 2>/dev/null || echo NOT FOUND)" >> {log}
+
+        # FIX: fail loudly if exec_annotation is missing — not a silent touch
+        if ! command -v exec_annotation &>/dev/null; then
+            echo "[KofamScan] FATAL: exec_annotation not found in {params.env_bin}." >> {log}
+            exit 1
+        fi
+
+        exec_annotation -f detail-tsv \
+            -o {output.kofamscan_tsv} \
+            --tmp-dir "$KOFAM_TMP" \
+            -p {params.profile} -k {params.ko_list} \
+            --cpu {threads} {input.proteins} >> {log} 2>&1
+
+        KSTAT=$?
+        echo "[KofamScan] Exit code: $KSTAT" >> {log}
+        rm -rf "$KOFAM_TMP"
+
+        # Guard: create empty TSV if nothing was produced
+        [ -f {output.kofamscan_tsv} ] || {{ echo "[KofamScan] No TSV produced — creating empty" >> {log}; touch {output.kofamscan_tsv}; }}
+
+        cp {output.kofamscan_tsv} {output.kofamscan_results}
+        echo "[KofamScan] Done." >> {log}
+        """
+
+
+rule dbcan:
+    input:  
+        faa = rules.prokka.output.faa
+    output:
+        overview = f"{OUTPUT_DIR}/{{sample}}/dbcan/overview.txt",
+        hmm_out  = f"{OUTPUT_DIR}/{{sample}}/dbcan/hmmer.out"
+    params:
+        db_dir   = DBCAN_DB_DIR,
+        outdir   = f"{OUTPUT_DIR}/{{sample}}/dbcan",
+        env_path = ENVS["dbcan"]
+    threads: 8
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/dbcan.log"
+    shell:
+        """
+        # FIX: removed set -euo pipefail — it kills the shell before guard blocks
+        # can create output files for Snakemake.
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        echo "[dbCAN] Started for {wildcards.sample}" > {log}
+        echo "[dbCAN] Input FAA  : {input.faa}"      >> {log}
+        echo "[dbCAN] DB dir     : {params.db_dir}"  >> {log}
+        echo "[dbCAN] Sequences  : $(grep -c '^>' {input.faa} 2>/dev/null || echo 0)" >> {log}
+        echo "[dbCAN] Running with --tools all ..."  >> {log}
+
+        run_dbcan {input.faa} protein \
+            --out_dir {params.outdir} \
+            --db_dir  {params.db_dir} \
+            --tools all \
+            --dia_cpu {threads} \
+            --hmm_cpu {threads} \
+            --tf_cpu  {threads} >> {log} 2>&1
+
+        DSTAT=$?
+        echo "[dbCAN] Exit code: $DSTAT" >> {log}
+
+        if [ ! -f "{output.overview}" ]; then
+            echo "[dbCAN] No overview.txt — writing minimal header" >> {log}
+            echo -e "HMMER\tdbCAN_sub\tDIAMOND\t#ofTools\tGene_ID" > {output.overview}
+        fi
+
+        if [ ! -f "{output.hmm_out}" ]; then
+            echo "[dbCAN] No hmmer.out — touching empty file" >> {log}
+            touch {output.hmm_out}
+        fi
+
+        echo "[dbCAN] Done." >> {log}
+        """
+
+
+rule eggnog_mapper:
+    input:  proteins = rules.prokka.output.faa
+    output:
+        annotations    = f"{OUTPUT_DIR}/{{sample}}/emapper_results/annotations.emapper.annotations",
+        seed_orthologs = f"{OUTPUT_DIR}/{{sample}}/emapper_results/annotations.emapper.seed_orthologs"
+    params:
+        outdir        = f"{OUTPUT_DIR}/{{sample}}/emapper_results",
+        env_path      = ENVS["eggnog"],
+        # FIX: eggnog-mapper requires --data_dir pointing to where eggnog.db lives.
+        # Without it emapper silently exits finding no database.
+        eggnog_data   = f"{ENVS['eggnog']}/lib/python3.10/site-packages/data"
+    threads: 8    # FIX: increased from 1
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/eggnog_mapper.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p "{params.outdir}" "$(dirname {log})"
+
+        echo "[EggNOG] Started for {wildcards.sample}" > {log}
+        echo "[EggNOG] Input    : {input.proteins}"   >> {log}
+        echo "[EggNOG] Outdir   : {params.outdir}"    >> {log}
+        echo "[EggNOG] Threads  : {threads}"          >> {log}
+        echo "[EggNOG] Data dir : {params.eggnog_data}" >> {log}
+        echo "[EggNOG] Sequences: $(grep -c '^>' {input.proteins} 2>/dev/null || echo 0)" >> {log}
+        echo "[EggNOG] emapper.py: $(which emapper.py 2>/dev/null || echo NOT FOUND)" >> {log}
+
+        # FIX: Resolve actual eggnog data dir — python version in path may differ.
+        EGGNOG_DATA="{params.eggnog_data}"
+        if [ ! -f "$EGGNOG_DATA/eggnog.db" ]; then
+            echo "[EggNOG] eggnog.db not at $EGGNOG_DATA — searching env..." >> {log}
+            FOUND_DB=$(find "{params.env_path}" -name "eggnog.db" 2>/dev/null | head -1 || true)
+            if [ -n "$FOUND_DB" ]; then
+                EGGNOG_DATA=$(dirname "$FOUND_DB")
+                echo "[EggNOG] Found eggnog.db at: $EGGNOG_DATA" >> {log}
+            else
+                echo "[EggNOG] FATAL: eggnog.db not found under {params.env_path}." >> {log}
+                echo "[EggNOG] Run: download_eggnog_data.py --data_dir $EGGNOG_DATA" >> {log}
+                exit 1
+            fi
+        fi
+        echo "[EggNOG] Using data dir: $EGGNOG_DATA" >> {log}
+
+        # FIX: removed --dbmem (requires ~40 GB RAM, silently crashes most machines)
+        # FIX: added --data_dir so emapper finds eggnog.db
+        emapper.py -i {input.proteins} \
+            --output_dir {params.outdir} --output annotations \
+            --data_dir "$EGGNOG_DATA" \
+            --cpu {threads} --query_cover 0.5 -m diamond \
+            --seed_ortholog_evalue 0.01 --sensmode fast \
+            --tax_scope 2 >> {log} 2>&1
+
+        ESTAT=$?
+        echo "[EggNOG] Exit code: $ESTAT" >> {log}
+
+        # Guards: create empty output files if emapper produced nothing
+        [ -f {output.annotations}    ] || {{ echo "[EggNOG] No annotations — creating empty" >> {log}; touch {output.annotations};    }}
+        [ -f {output.seed_orthologs} ] || {{ echo "[EggNOG] No seed_orthologs — creating empty" >> {log}; touch {output.seed_orthologs}; }}
+
+        echo "[EggNOG] Done." >> {log}
+        """
+
+
+rule abricate:
+    """Screen assembly for AMR, virulence genes and plasmids with ABRicate."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        resfinder     = f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_resfinder.csv",
+        ncbi          = f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_ncbi.csv",
+        card          = f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_card.csv",
+        vfdb          = f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_vfdb.csv",
+        plasmidfinder = f"{OUTPUT_DIR}/{{sample}}/abricate/abricate_plasmidfinder.csv"
+    params:
+        env_bin = f"{ENVS['abricate']}/bin"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/abricate.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.resfinder}) $(dirname {log})
+
+        run_abricate() {{
+            local DB=$1 OUT=$2
+            echo "[ABRicate] Running db=$DB" | tee -a {log}
+            abricate --db "$DB" --minid 90 --mincov 80 --csv \
+                --threads {threads} {input.contigs} > "$OUT" 2>> {log} \
+                || {{ echo "[ABRicate] WARNING: db=$DB failed -- writing empty output" | tee -a {log}
+                     echo "#FILE,SEQUENCE,START,END,STRAND,GENE,COVERAGE,COVERAGE_MAP,GAPS,%%COVERAGE,%%IDENTITY,DATABASE,ACCESSION,PRODUCT,RESISTANCE" > "$OUT"; }}
+        }}
+
+        run_abricate resfinder     {output.resfinder}
+        run_abricate ncbi          {output.ncbi}
+        run_abricate card          {output.card}
+        run_abricate vfdb          {output.vfdb}
+        run_abricate plasmidfinder {output.plasmidfinder}
+        """
+
+
+rule cctyper:
+    """CRISPR-Cas system detection with CRISPRCasTyper (matches short-read pipeline)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        summary     = f"{OUTPUT_DIR}/{{sample}}/crispr_output/crispr_summary.txt",
+        crispr_cas  = f"{OUTPUT_DIR}/{{sample}}/crispr_output/CRISPR_Cas.tab",
+        cas_operons = f"{OUTPUT_DIR}/{{sample}}/crispr_output/cas_operons.tab"
+    params:
+        outdir   = f"{OUTPUT_DIR}/{{sample}}/crispr_output",
+        env_path = ENVS["cctyper"]
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/cctyper.log"
+    shell:
+        r"""
+        # FIX: use export PATH — conda activate is broken in Snakemake shell blocks
+        export PATH={params.env_path}/bin:$PATH
+        export CCTYPER_DB="{params.env_path}/share/cctyper"
+
+        mkdir -p $(dirname {log})
+
+        echo "[CCTyper] Started for {wildcards.sample}"  > {log}
+        echo "[CCTyper] Input   : {input.contigs}"      >> {log}
+        echo "[CCTyper] DB      : $CCTYPER_DB"          >> {log}
+        echo "[CCTyper] env_path: {params.env_path}"    >> {log}
+
+        # cctyper 1.8.0 refuses to run if outdir already exists — wipe it first
+        rm -rf {params.outdir}
+
+        cctyper {input.contigs} {params.outdir} \
+            --db "$CCTYPER_DB" \
+            --prodigal single \
+            --threads {threads} >> {log} 2>&1
+
+        CSTAT=$?
+        echo "[CCTyper] Exit code: $CSTAT" >> {log}
+
+        # ── Output fixing ─────────────────────────────────────────────────
+        if [ -s "{params.outdir}/CRISPR_Cas.tab" ]; then
+            # cp {params.outdir}/CRISPR_Cas.tab {output.crispr_cas}
+
+            if [ -f "{params.outdir}/cas_operons_putative.tab" ]; then
+                cp {params.outdir}/cas_operons_putative.tab {output.cas_operons}
+            else
+                touch {output.cas_operons}
+            fi
+
+            echo "CRISPR-Cas systems detected" > {output.summary}
+            cat {output.crispr_cas} >> {output.summary}
+            echo "[CCTyper] CRISPR-Cas systems found." >> {log}
+        else
+            echo "No CRISPR-Cas systems detected." > {output.summary}
+            touch {output.crispr_cas}
+            touch {output.cas_operons}
+            echo "[CCTyper] No CRISPR-Cas systems detected." >> {log}
+        fi
+
+        echo "[CCTyper] Done." >> {log}
+        """
+
+
+rule antismash:
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        antismash_results = f"{OUTPUT_DIR}/{{sample}}/antismash_results/knownclusterblast.txt",
+        index_html        = f"{OUTPUT_DIR}/{{sample}}/antismash_results/index.html"
+    params:
+        antismash_db = ANTISMASH_DB,
+        output_dir   = f"{OUTPUT_DIR}/{{sample}}/antismash_results",
+        env_path     = ENVS["antismash"]
+    threads: 8
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/antismash.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        export ANTISMASH_DATABASES="{params.antismash_db}"
+        mkdir -p "{params.output_dir}" "$(dirname {log})"
+        PYTHONWARNINGS="ignore::BiopythonWarning" antismash {input.contigs} \
+            --output-dir {params.output_dir} \
+            --genefinding-tool prodigal --taxon bacteria \
+            --cb-knownclusters --cb-subclusters --cb-general \
+            --cc-mibig --fullhmmer --clusterhmmer \
+            --asf --pfam2go --enable-genefunctions --tigrfam --tfbs --rre --smcog-trees \
+            --enable-nrps-pks --enable-lanthipeptides --enable-lassopeptides \
+            --enable-thiopeptides --enable-terpene --enable-html \
+            --cpus {threads} &> {log}
+        [ -f {params.output_dir}/knownclusterblast.txt ] \
+            || touch {params.output_dir}/knownclusterblast.txt
+        # Guarantee index.html exists for Snakemake output tracking
+        [ -f {params.output_dir}/index.html ] \
+            || touch {params.output_dir}/index.html
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  STEP — REPEATMASKER
+# ═════════════════════════════════════════════════════════════════════════════
+
+rule repeatmasker:
+    """Mask repetitive elements with RepeatMasker (matches short-read pipeline)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        masked_fasta = f"{OUTPUT_DIR}/{{sample}}/repeatmasker/contigs.masked.fasta"
+    params:
+        env_path = ENVS["marine"]
+    threads: 1
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/repeatmasker.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p $(dirname {output.masked_fasta}) $(dirname {log})
+        if [ -n "${LIBNSL_DIR:-}" ] && [ -d "${LIBNSL_DIR}" ]; then
+            export LD_LIBRARY_PATH="${LIBNSL_DIR}:$LD_LIBRARY_PATH"
+        fi
+        RepeatMasker -species all -gff \
+            -dir $(dirname {output.masked_fasta}) {input.contigs} &> {log}
+        # RepeatMasker names output <input>.masked — rename to expected path
+        MASKED_SRC="$(dirname {output.masked_fasta})/$(basename {input.contigs}).masked"
+        if [ -f "$MASKED_SRC" ] && [ "$MASKED_SRC" != "{output.masked_fasta}" ]; then
+            mv "$MASKED_SRC" {output.masked_fasta}
+        elif [ ! -f "{output.masked_fasta}" ]; then
+            # No repeats found — RepeatMasker skips .masked; copy original
+            cp {input.contigs} {output.masked_fasta}
+        fi
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  STEP — HADEG  (hydrocarbon degradation gene annotation)
+# ═════════════════════════════════════════════════════════════════════════════
+
+rule hadeg:
+    input:
+        faa = rules.prokka.output.faa
+    output:
+        done_flag = f"{OUTPUT_DIR}/{{sample}}/hadeg/hadeg_done.flag"
+    params:
+        hadeg_db      = HADEG_DB,
+        hadeg_rscript = HADEG_RSCRIPT,
+        outdir        = f"{OUTPUT_DIR}/{{sample}}/hadeg",
+        env_path      = ENVS["hadeg"],
+        conda_envs    = os.path.expanduser("~/.conda/envs")
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/hadeg.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+
+        # FIX: capture absolute paths BEFORE cd changes the working directory
+        LOG_ABS=$(realpath {log})
+        FAA_ABS=$(realpath {input.faa})
+
+        echo "[HADEG] Started for {wildcards.sample}"         > "$LOG_ABS"
+        echo "[HADEG] Input FAA    : $FAA_ABS"               >> "$LOG_ABS"
+        echo "[HADEG] HADEG DB     : {params.hadeg_db}"      >> "$LOG_ABS"
+        echo "[HADEG] Outdir       : {params.outdir}"        >> "$LOG_ABS"
+        echo "[HADEG] Sequences    : $(grep -c '^>' "$FAA_ABS" 2>/dev/null || echo 0)" >> "$LOG_ABS"
+
+        # ── Check proteinortho ─────────────────────────────────────────────
+        if ! command -v proteinortho &>/dev/null; then
+            echo "[HADEG] FATAL: proteinortho not found in {params.env_path}/bin" >> "$LOG_ABS"
+            exit 1
+        fi
+        echo "[HADEG] proteinortho: $(which proteinortho)" >> "$LOG_ABS"
+
+        # ── Locate Rscript (not always in hadeg env) ───────────────────────
+        RSCRIPT_BIN=""
+        if command -v Rscript &>/dev/null; then
+            RSCRIPT_BIN=$(which Rscript)
+            echo "[HADEG] Rscript in PATH: $RSCRIPT_BIN" >> "$LOG_ABS"
+        else
+            echo "[HADEG] Rscript not in PATH — searching conda envs..." >> "$LOG_ABS"
+            RSCRIPT_BIN=$(find {params.conda_envs} -maxdepth 3 -name "Rscript" -type f 2>/dev/null | head -1 || true)
+            if [ -n "$RSCRIPT_BIN" ]; then
+                echo "[HADEG] Rscript found: $RSCRIPT_BIN" >> "$LOG_ABS"
+            else
+                echo "[HADEG] WARNING: Rscript not found — plots will be skipped" >> "$LOG_ABS"
+            fi
+        fi
+
+        # ── Check DB and R script exist ───────────────────────────────────
+        if [ ! -f "{params.hadeg_db}" ]; then
+            echo "[HADEG] FATAL: HADEG DB not found: {params.hadeg_db}" >> "$LOG_ABS"
+            exit 1
+        fi
+        if [ ! -f "{params.hadeg_rscript}" ]; then
+            echo "[HADEG] FATAL: HADEG.R not found: {params.hadeg_rscript}" >> "$LOG_ABS"
+            exit 1
+        fi
+
+        # ── cd into outdir so proteinortho writes files here ──────────────
+        cd {params.outdir}
+        cp "$FAA_ABS" annotated_genome.faa
+
+        echo "[HADEG] CWD: $(pwd)" >> "$LOG_ABS"
+        echo "[HADEG] Running proteinortho..." >> "$LOG_ABS"
+
+        # FIX: '-evalue=' is invalid — correct flag is '-e='
+        # FIX: all flags BEFORE FASTA file arguments
+        # FIX: added -cpus for multi-threading; use same params as longread pipeline
+        proteinortho \
+            -project=Results_HADEG \
+            -identity=30 \
+            -conn=0.1 \
+            -e=1e-5 \
+            -cpus={threads} \
+            annotated_genome.faa {params.hadeg_db} \
+            >> "$LOG_ABS" 2>&1
+
+        POSTAT=$?
+        echo "[HADEG] proteinortho exit code: $POSTAT" >> "$LOG_ABS"
+
+        # FIX: check primary output before touching done flag
+        if [ ! -f "Results_HADEG.proteinortho" ]; then
+            echo "[HADEG] FATAL: Results_HADEG.proteinortho not produced." >> "$LOG_ABS"
+            echo "[HADEG] Files present: $(ls -1 {params.outdir}/ 2>/dev/null || echo none)" >> "$LOG_ABS"
+            exit 1
+        fi
+
+        NHITS=$(tail -n +2 Results_HADEG.proteinortho | grep -vc '^[*]' 2>/dev/null || echo 0)
+        echo "[HADEG] Orthogroups with hits: $NHITS" >> "$LOG_ABS"
+
+        # ── Run R script (optional — only if Rscript found) ───────────────
+        if [ -n "$RSCRIPT_BIN" ]; then
+            echo "[HADEG] Running HADEG.R..." >> "$LOG_ABS"
+            "$RSCRIPT_BIN" {params.hadeg_rscript} >> "$LOG_ABS" 2>&1
+            RSTAT=$?
+            if [ "$RSTAT" -ne 0 ]; then
+                echo "[HADEG] WARNING: Rscript failed (exit $RSTAT) — check R packages:" >> "$LOG_ABS"
+                echo "[HADEG]   ggplot2, dplyr, reshape2, pheatmap, RColorBrewer" >> "$LOG_ABS"
+            else
+                echo "[HADEG] Rscript completed successfully." >> "$LOG_ABS"
+            fi
+        else
+            echo "[HADEG] WARNING: Rscript not found — skipping plots." >> "$LOG_ABS"
+        fi
+
+        touch {output.done_flag}
+        echo "[HADEG] Done." >> "$LOG_ABS"
+        """
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  STEP — BARRNAP  (16S rRNA gene extraction)
+# ═════════════════════════════════════════════════════════════════════════════
+
+rule barrnap_16s:
+    """Extract 16S rRNA gene sequences with Barrnap (matches short-read pipeline)."""
+    input:
+        contigs = rules.unicycler.output.assembly
+    output:
+        gff   = f"{OUTPUT_DIR}/{{sample}}/barrnap/contigs_16s.gff",
+        fasta = f"{OUTPUT_DIR}/{{sample}}/barrnap/contigs_16s.fasta"
+    params:
+        env_bin = f"{ENVS['barrnap']}/bin"
+    threads: 2
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/barrnap.log"
+    shell:
+        """
+        export PATH={params.env_bin}:$PATH
+        mkdir -p $(dirname {output.gff}) $(dirname {log})
+
+        barrnap --kingdom bac --threads {threads} {input.contigs} \
+            2>> {log} | grep "16S_rRNA" > {output.gff} || true
+
+        if [ ! -s {output.gff} ]; then
+            echo "[Barrnap] No 16S rRNA genes detected in {wildcards.sample}" | tee -a {log}
+            touch {output.fasta}
+        else
+            bedtools getfasta \
+                -fi  {input.contigs} \
+                -bed {output.gff} \
+                -fo  {output.fasta} 2>> {log}
+            echo "[Barrnap] 16S sequences extracted: $(grep -c '>' {output.fasta})" | tee -a {log}
+        fi
+        """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLAST 16S (Added - this rule was missing)
+# ─────────────────────────────────────────────────────────────────────────────
+rule blast_16s:
+    input:
+        fasta_16s = rules.barrnap_16s.output.fasta
+    output:
+        blast_out = f"{OUTPUT_DIR}/{{sample}}/blast_16s/blast_16s_results.txt"
+    params:
+        db = SILVA_BLAST_DB,
+        outdir = f"{OUTPUT_DIR}/{{sample}}/blast_16s",
+        env_path = ENVS["marine"]
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/blast_16s.log"
+    shell:
+        """
+        export PATH={params.env_path}/bin:$PATH
+        mkdir -p {params.outdir} $(dirname {log})
+        if [ ! -s {input.fasta_16s} ]; then
+            echo "[BLAST 16S] No 16S sequences found — skipping BLAST" | tee {log}
+            echo "# No 16S sequences detected by barrnap — BLAST skipped" > {output.blast_out}
+        else
+            echo "[BLAST 16S] Running BLASTn against SILVA for {wildcards.sample}" | tee {log}
+            blastn \
+                -query {input.fasta_16s} \
+                -db {params.db} \
+                -out {output.blast_out} \
+                -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle" \
+                -num_threads {threads} \
+                -max_target_seqs 5 \
+                -perc_identity 80 \
+                -evalue 1e-10 \
+                -task blastn \
+                &>> {log}
+            if [ ! -s {output.blast_out} ]; then
+                echo "# No significant BLAST hits found" > {output.blast_out}
+            fi
+            echo "[BLAST 16S] Top hits:" | tee -a {log}
+            head -5 {output.blast_out} | tee -a {log}
+        fi
+        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FASTANI (Fixed escaping)
+# ─────────────────────────────────────────────────────────────────────────────
+rule fastani:
+    input:
+        contigs   = rules.unicycler.output.assembly,
+        blast_16s = rules.blast_16s.output.blast_out
+    output:
+        ani_result = f"{OUTPUT_DIR}/{{sample}}/fastani/fastani_results.txt"
+    params:
+        fastani_env = ENVS["fastani"],
+        ncbi_env    = ENVS["ncbi"],
+        outdir      = f"{OUTPUT_DIR}/{{sample}}/fastani",
+        ref_dir     = f"{OUTPUT_DIR}/{{sample}}/fastani/ref_genomes"
+    threads: 4
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/fastani.log"
+    shell:
+        r"""
+        mkdir -p {params.outdir} {params.ref_dir} $(dirname {log})
+
+        export PATH={params.fastani_env}/bin:{params.ncbi_env}/bin:$PATH
+
+        echo "[FastANI] Started for sample {wildcards.sample}" > {log}
+        echo "[FastANI] fastani_env : {params.fastani_env}"   >> {log}
+        echo "[FastANI] ncbi_env    : {params.ncbi_env}"      >> {log}
+
+        FASTANI_BIN="{params.fastani_env}/bin/fastANI"
+        [ -x "$FASTANI_BIN" ] || FASTANI_BIN=$(which fastANI 2>/dev/null || true)
+        if [ ! -x "$FASTANI_BIN" ]; then
+            echo "[FastANI] ERROR: fastANI binary not found in {params.fastani_env}/bin or PATH." >> {log}
+            echo "[FastANI] Check: ls {params.fastani_env}/bin/fastANI" >> {log}
+            echo "# fastANI not found — skipping" > {output.ani_result}
+            exit 0
+        fi
+        echo "[FastANI] Binary: $FASTANI_BIN" >> {log}
+
+        NGD_BIN="{params.ncbi_env}/bin/ncbi-genome-download"
+        [ -x "$NGD_BIN" ] || NGD_BIN=$(which ncbi-genome-download 2>/dev/null || true)
+        if [ ! -x "$NGD_BIN" ]; then
+            echo "[FastANI] ERROR: ncbi-genome-download not found in {params.ncbi_env}/bin or PATH." >> {log}
+            echo "[FastANI] Install: conda install -n ncbi_env -c bioconda ncbi-genome-download" >> {log}
+            echo "# ncbi-genome-download not found — FastANI skipped" > {output.ani_result}
+            exit 0
+        fi
+        echo "[FastANI] ncbi-genome-download: $NGD_BIN" >> {log}
+
+        echo "[FastANI] Parsing top BLAST hits from {input.blast_16s}" >> {log}
+
+        # FIX: SILVA stitle (col 13) format is "taxonomy;Genus species strain"
+        # Old awk -F';' $NF often returned empty strings or strain info.
+        # New approach: sed to strip everything up to last semicolon, then take first two words.
+        SPECIES_LIST=$(grep -v '^#' "{input.blast_16s}" | head -5 \
+            | awk -F'\t' 'NF>=13 {{print $13}}' \
+            | sed 's/.*;//' \
+            | sed 's/^ *//; s/ *$//' \
+            | awk 'NF>=2 {{print $1" "$2}}' \
+            | grep -vE '^ *$|^[Uu]ncultured|^[Uu]nclassified|^[Ee]nvironmental' \
+            | sort -u || true)
+
+        echo "[FastANI] Parsed species list:" >> {log}
+        echo "$SPECIES_LIST" >> {log}
+
+        if [ -z "$SPECIES_LIST" ]; then
+            echo "[FastANI] No species-level BLAST hits — trying genus level." >> {log}
+            SPECIES_LIST=$(grep -v '^#' "{input.blast_16s}" | head -5 \
+                | awk -F'\t' 'NF>=13 {{print $13}}' \
+                | sed 's/.*;//' \
+                | sed 's/^ *//; s/ *$//' \
+                | awk 'NF>=1 {{print $1}}' \
+                | grep -vE '^ *$|^[Uu]ncultured|^[Uu]nclassified|^[Ee]nvironmental' \
+                | sort -u || true)
+        fi
+
+        if [ -z "$SPECIES_LIST" ]; then
+            echo "[FastANI] No BLAST hits — cannot auto-select reference genomes." >> {log}
+            echo "# No BLAST hits to drive reference selection — FastANI skipped" > {output.ani_result}
+            exit 0
+        fi
+
+        echo "[FastANI] Species to download references for:" | tee -a {log}
+        echo "$SPECIES_LIST" | tee -a {log}
+
+        while IFS= read -r SPECIES; do
+            [ -z "$SPECIES" ] && continue
+            SAFE=$(echo "$SPECIES" | tr ' ' '_' | tr -cd 'A-Za-z0-9_-')
+            SPECIES_DIR="{params.ref_dir}/$SAFE"
+
+            if [ -d "$SPECIES_DIR" ] && \
+               [ "$(find "$SPECIES_DIR" -maxdepth 1 -name '*.fna' 2>/dev/null | wc -l)" -gt 0 ]; then
+                echo "[FastANI] Using cached genomes for '$SPECIES'" | tee -a {log}
+            else
+                mkdir -p "$SPECIES_DIR"
+                echo "[FastANI] Downloading genomes for '$SPECIES' ..." | tee -a {log}
+                "$NGD_BIN" bacteria \
+                    -g "$SPECIES" \
+                    -F fasta \
+                    -l complete,chromosome,scaffold \
+                    -R reference,representative \
+                    -o "$SPECIES_DIR" \
+                    --flat-output \
+                    -r 3 \
+                    2>> {log} || \
+                    echo "[FastANI] WARNING: download non-zero for '$SPECIES' — continuing" | tee -a {log}
+                find "$SPECIES_DIR" -name "*.fna.gz" -exec gunzip -f {{}} \; 2>> {log} || true
+                NFNA=$(find "$SPECIES_DIR" -name "*.fna" | wc -l)
+                echo "[FastANI] Downloaded $NFNA FASTA file(s) for '$SPECIES'" | tee -a {log}
+            fi
+        done <<< "$SPECIES_LIST"
+
+        REF_LIST="{params.outdir}/ref_list.txt"
+        find {params.ref_dir} -name "*.fna" > "$REF_LIST"
+
+        NREF=$(wc -l < "$REF_LIST")
+        if [ "$NREF" -eq 0 ]; then
+            echo "[FastANI] No reference FASTAs found after download — FastANI skipped." | tee -a {log}
+            echo "# No reference genomes downloaded — FastANI skipped" > {output.ani_result}
+            exit 0
+        fi
+        echo "[FastANI] Total reference genomes for ANI: $NREF" | tee -a {log}
+
+        QUERY_LIST="{params.outdir}/query_list.txt"
+        echo "{input.contigs}" > "$QUERY_LIST"
+
+        echo "[FastANI] Running fastANI (query vs $NREF references) ..." | tee -a {log}
+        "$FASTANI_BIN" \
+            --ql "$QUERY_LIST" \
+            --rl "$REF_LIST" \
+            -t   {threads} \
+            -o   {output.ani_result} >> {log} 2>&1 || true
+
+        if [ -s {output.ani_result} ]; then
+            TMP_SORT="{params.outdir}/ani_sorted_tmp.txt"
+            echo -e "# FastANI results for {wildcards.sample}" > "$TMP_SORT"
+            echo -e "# Columns: query\treference\tANI\tbi-directional_fragments\ttotal_fragments" >> "$TMP_SORT"
+            sort -t$'\t' -k3 -nr {output.ani_result} >> "$TMP_SORT"
+            mv "$TMP_SORT" {output.ani_result}
+            echo "[FastANI] Done. Top 5 results:" | tee -a {log}
+            grep -v '^#' {output.ani_result} | head -5 | tee -a {log}
+        else
+            echo "# No ANI results above threshold" > {output.ani_result}
+            echo "[FastANI] No ANI results above threshold." | tee -a {log}
+        fi
+        """
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FINAL REPORT
+# ═════════════════════════════════════════════════════════════════════════════
+
+rule final_report:
+    """Compile a human-readable summary report for the sample."""
+    input:
+        decision    = rules.pipeline_decision.output.log_out,
+        nanoplot    = rules.nanoplot.output.stats,
+        quast       = rules.quast.output.report,
+        busco       = rules.busco.output.summary,
+        checkm      = rules.checkm.output.summary,
+        fastani     = rules.fastani.output.ani_result,
+        prokka      = rules.prokka.output.gff,
+        interpro    = rules.interproscan.output.tsv,
+        kofamscan   = rules.kofamscan.output.kofamscan_results,
+        dbcan       = rules.dbcan.output.overview,
+        crispr      = rules.cctyper.output.summary,
+        antismash   = rules.antismash.output.antismash_results,
+        eggnog      = rules.eggnog_mapper.output.annotations,
+        repeatmasker= rules.repeatmasker.output.masked_fasta,
+        hadeg       = rules.hadeg.output.done_flag,
+        barrnap     = rules.barrnap_16s.output.fasta,
+        blast_16s   = rules.blast_16s.output.blast_out
+    output:
+        report = f"{OUTPUT_DIR}/{{sample}}/final_report.txt"
+    log: f"{OUTPUT_DIR}/{{sample}}/logs/final_report.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.report}) $(dirname {log})
+        {{
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║   HYBRID WGS PIPELINE  ·  UNICYCLER  —  FINAL REPORT   ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "  Sample     : {wildcards.sample}"
+          echo "  Assembler  : Unicycler (hybrid)"
+          echo "  Date       : $(date)"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          echo ""
+          echo "══ LONG-READ DECISION (coverage / read-type / filtering) ══"
+          cat {input.decision}
+
+          echo ""
+          echo "══ NANOPLOT LONG-READ STATS ══"
+          cat {input.nanoplot}
+
+          echo ""
+          echo "══ QUAST ASSEMBLY REPORT ══"
+          echo "  Full HTML: {input.quast}"
+
+          echo ""
+          echo "══ BUSCO COMPLETENESS ══"
+          [ -f {input.busco} ]     && cat {input.busco}          || echo "  Not found"
+
+          echo ""
+          echo "══ CHECKM QUALITY (first 20 lines) ══"
+          [ -f {input.checkm} ]    && head -20 {input.checkm}    || echo "  Not found"
+
+          echo ""
+          echo "══ FASTANI SPECIES ID (top 10) ══"
+          [ -f {input.fastani} ]   && head -10 {input.fastani}   || echo "  Not found"
+
+          echo ""
+          echo "══ CRISPR SUMMARY (top 20 lines) ══"
+          [ -f {input.crispr} ]    && head -20 {input.crispr}    || echo "  Not found"
+
+          echo ""
+          echo "══ ANTISMASH BGC HITS (top 20 lines) ══"
+          [ -f {input.antismash} ] && head -20 {input.antismash} || echo "  Not found"
+
+          echo ""
+          echo "══ REPEATMASKER ══"
+          [ -f {input.repeatmasker} ] && echo "Masked FASTA created: {input.repeatmasker}" || echo "  Not found"
+
+          echo ""
+          echo "══ HADEG (hydrocarbon degradation) ══"
+          [ -f {input.hadeg} ] && echo "Completed — see $(dirname {input.hadeg})/" || echo "  Not found"
+
+          echo ""
+          echo "══ BARRNAP 16S rRNA ══"
+          if [ -s {input.barrnap} ]; then
+              echo "Sequences found: $(grep -c '>' {input.barrnap})"
+          else
+              echo "No 16S rRNA genes detected"
+          fi
+
+          echo ""
+          echo "══ 16S BLAST identification (SILVA) ══"
+          if [ -s {input.blast_16s} ]; then
+              echo "qseqid  sseqid  pident  length  evalue  bitscore  taxonomy"
+              head -5 {input.blast_16s}
+          else
+              echo "No BLAST hits or skipped"
+          fi
+
+          echo ""
+          echo "══ OUTPUT FILE LOCATIONS ══"
+          echo "  Unicycler assembly : $(dirname {input.quast})/../unicycler/assembly.fasta"
+          echo "  Prokka GFF         : {input.prokka}"
+          echo "  InterProScan TSV   : {input.interpro}"
+          echo "  KofamScan TSV      : {input.kofamscan}"
+          echo "  dbCAN overview     : {input.dbcan}"
+          echo "  EggNOG annotations : {input.eggnog}"
+          echo "  RepeatMasker       : {input.repeatmasker}"
+          echo "  HADEG flag         : {input.hadeg}"
+          echo "  Barrnap 16S FASTA  : {input.barrnap}"
+          echo "  16S BLAST results  : {input.blast_16s}"
+        }} > {output.report} 2> {log}
+        """

@@ -1,0 +1,1021 @@
+[
+  {
+    "id": "intro_pipeline",
+    "title": "What is the GENOCULAR analysis platform?",
+    "tags": [
+      "platform_overview",
+      "overview",
+      "pipeline",
+      "genocular",
+      "wgs",
+      "metagenomics",
+      "introduction"
+    ],
+    "text": "GENOCULAR is a microbial genome and metagenome analysis server. It supports six active profiles: WGS short reads, WGS long reads, WGS hybrid reads, metagenomics short reads, metagenomics long reads, and metagenomics hybrid reads. Depending on the selected profile, it performs read QC, trimming/filtering, host or contaminant removal where relevant, taxonomic profiling/classification, assembly, polishing, mapping, binning, MAG quality control, genome or MAG annotation, functional and marker screening, abundance estimation, final reports, manifests, and analysis-ready plots. The web interface supports account-free private upload, job submission, queue/running status, step-wise progress, logs, result browsing, and downloads. Optional accounts add job history but are not required to run analyses.",
+    "category": "platform_overview"
+  },
+  {
+    "id": "supported_samples",
+    "title": "What kind of data does GENOCULAR support?",
+    "tags": [
+      "inputs_and_submission",
+      "inputs",
+      "supported data",
+      "illumina",
+      "ont",
+      "nanopore",
+      "paired-end",
+      "long reads",
+      "sample requirements",
+      "wgs",
+      "metagenomics"
+    ],
+    "text": "GENOCULAR supports microbial isolate WGS datasets and microbial community/metagenomics datasets. Short-read mode expects paired-end FASTQ files, R1 and R2, usually Illumina. Long-read mode expects one long-read FASTQ file, typically ONT/Nanopore; internally the long-read file is submitted through the R1 input path for compatibility. Hybrid mode expects R1, R2, and one R_long file from the same biological sample or compatible study design. The platform is intended for microbial isolates and microbial communities, not human WGS interpretation.",
+    "category": "inputs_and_submission"
+  },
+  {
+    "id": "upload_fastq",
+    "title": "Uploading FASTQ files",
+    "tags": [
+      "inputs_and_submission",
+      "upload",
+      "fastq",
+      "paired-end",
+      "inputs",
+      "r1",
+      "r2",
+      "long",
+      "hybrid"
+    ],
+    "text": "Upload requirements depend on the selected read mode. Short-read mode requires R1 and R2 FASTQ files. Long-read mode requires one long-read FASTQ file. Hybrid mode requires R1, R2, and R_long. Filenames should clearly indicate read pairing or long-read origin. Supported extensions include .fastq, .fq, and gzipped versions. Uploads continue while navigating inside GENOCULAR. After a network interruption, browser refresh, or browser restart, return to Upload & Run, reselect the same local file or files, and choose Resume upload. GENOCULAR verifies the file and the completed MinIO multipart chunks, then sends only missing chunks.",
+    "category": "inputs_and_submission"
+  },
+  {
+    "id": "job_submission",
+    "title": "Submitting a job",
+    "tags": [
+      "inputs_and_submission",
+      "submit",
+      "run pipeline",
+      "queue",
+      "job id",
+      "profile",
+      "advanced config"
+    ],
+    "text": "When a user clicks Run pipeline, GENOCULAR validates the selected analysis type and read mode, checks required inputs, creates a private job-scoped access link, records input metadata, and starts the selected automated workflow. Short mode requires R1 and R2. Long mode requires one long-read file. Hybrid mode requires R1, R2, and R_long. The submitted job records the selected profile, analysis type, read mode, input file references, and optional metagenomics advanced settings. Users should retain the private link or recovery file for later access.",
+    "category": "inputs_and_submission"
+  },
+  {
+    "id": "job_name_defaults",
+    "title": "Default job naming",
+    "tags": [
+      "inputs_and_submission",
+      "job name",
+      "sample name",
+      "default",
+      "metadata"
+    ],
+    "text": "The Run page generates default job names based on the selected analysis type, read mode, and date, for example WGS_short_DD_MM_YYYY or Meta_hybrid_DD_MM_YYYY. Users can replace this with a meaningful sample or project name. The job name is used in output folders and reports, so it should be concise and avoid path-breaking characters.",
+    "category": "inputs_and_submission"
+  },
+  {
+    "id": "sample_naming",
+    "title": "Choosing a sample/job name",
+    "tags": [
+      "inputs_and_submission",
+      "sample name",
+      "job name",
+      "metadata",
+      "inputs"
+    ],
+    "text": "The sample or job name is used to label outputs and folders in the results. Choose a short, descriptive name without spaces or special characters (for example: ILSM1213, Ecoli_PA2, or Sample01). The same name will appear in QC reports, assembly summaries, and downstream analysis outputs. Avoid using extremely long names, emojis, or characters like /, \\\\, or * that may cause problems in file paths.",
+    "category": "inputs_and_submission"
+  },
+  {
+    "id": "pipeline_profiles",
+    "title": "GENOCULAR active pipeline profiles",
+    "tags": [
+      "pipeline_profiles",
+      "profiles",
+      "wgs short",
+      "wgs long",
+      "wgs hybrid",
+      "metagenomics short",
+      "metagenomics long",
+      "metagenomics hybrid",
+      "read mode",
+      "update 2026"
+    ],
+    "text": "GENOCULAR currently supports six runnable profiles: WGS short reads, WGS long reads, WGS hybrid reads, metagenomics short reads, metagenomics long reads, and metagenomics hybrid reads. WGS profiles are for microbial isolate genome analysis, including read QC, cleaning, assembly, annotation, genome quality checks, feature detection, resistance or marker screening, 16S checks, ANI, and reports. Metagenomics profiles are for microbial community analysis and are generally heavier because they include profiling, assembly, read mapping, depth calculation, MAG binning, consensus bin selection, MAG quality assessment, taxonomy, dereplication, abundance estimation, MAG annotation, gene catalogues or gene quantification, MultiQC, and analysis plots. Choose WGS for isolate samples and metagenomics for mixed-community samples. Choose short, long, or hybrid according to the sequencing data available.",
+    "category": "pipeline_profiles"
+  },
+  {
+    "id": "choosing_profile",
+    "title": "Choosing the correct analysis profile",
+    "tags": [
+      "pipeline_profiles",
+      "choose profile",
+      "which mode",
+      "wgs vs metagenomics",
+      "short vs long vs hybrid"
+    ],
+    "text": "Use WGS when the sample is an isolate genome and the goal is genome assembly/annotation and isolate-level screening. Use Metagenomics when the sample contains a microbial community and the goal includes community profiling, metagenome assembly, MAG recovery, MAG taxonomy, or abundance. Use short mode for paired-end Illumina R1/R2 data, long mode for a single ONT/Nanopore-style long-read file, and hybrid mode when both paired short reads and long reads are available for the same sample.",
+    "category": "pipeline_profiles"
+  },
+  {
+    "id": "wgs_short_workflow",
+    "title": "WGS short-read workflow",
+    "tags": [
+      "wgs_workflows",
+      "wgs",
+      "short",
+      "illumina",
+      "fastqc",
+      "trimmomatic",
+      "cutadapt",
+      "seqtk",
+      "bbduk",
+      "spades",
+      "prokka",
+      "quast",
+      "busco",
+      "checkm",
+      "abricate",
+      "kofam",
+      "dbcan",
+      "eggnog",
+      "cctyper",
+      "antismash",
+      "hadeg",
+      "fastani"
+    ],
+    "text": "The WGS short-read profile uses paired-end R1/R2 reads. The current step order is: FastQC raw QC, Trimmomatic, Cutadapt paired trimming, Seqtk trimming, BBDuk filtering, FastQC trimmed QC, Kraken2 classification, KrakenTools read extraction, SPAdes assembly, Prokka annotation, RepeatMasker, InterProScan, QUAST, BUSCO, CheckM, Prodigal, ABRicate, KofamScan, dbCAN, eggNOG-mapper, CCTyper, antiSMASH, HADEG, Barrnap 16S extraction, BLAST 16S, FastANI, and final report generation. For biologists: FastQC and FastQC trimmed reports show whether sequencing quality improved after cleaning; Trimmomatic, Cutadapt, Seqtk, and BBDuk remove adapters, weak bases, very short reads, and contaminants; Kraken2/KrakenTools check taxonomic signal before assembly; SPAdes builds contigs from short reads; QUAST, BUSCO, and CheckM judge assembly quality and completeness; Prokka and Prodigal identify genes; InterProScan, KofamScan, eggNOG-mapper, and dbCAN add functional meaning; ABRicate, CCTyper, antiSMASH, HADEG, Barrnap, BLAST 16S, and FastANI support biological interpretation such as AMR/marker screening, CRISPR systems, biosynthetic potential, degradation genes, 16S checks, and genome relatedness.",
+    "category": "wgs_workflows"
+  },
+  {
+    "id": "wgs_long_workflow",
+    "title": "WGS long-read workflow",
+    "tags": [
+      "wgs_workflows",
+      "wgs",
+      "long",
+      "nanopore",
+      "ont",
+      "nanoplot",
+      "adaptive filtering",
+      "flye",
+      "racon",
+      "quast",
+      "busco",
+      "checkm",
+      "prokka",
+      "annotation",
+      "fastani"
+    ],
+    "text": "The WGS long-read profile uses a single long-read FASTQ file. The current step order is: NanoPlot, adaptive pipeline decision, adaptive long-read filtering, Kraken2 classification, KrakenTools read extraction, Flye assembly, Racon polishing round 1, Racon polishing round 2, final assembly selection, QUAST, BUSCO, CheckM, Barrnap 16S, BLAST 16S, FastANI, Prokka, Prodigal, InterProScan, KofamScan, dbCAN, eggNOG-mapper, ABRicate, CCTyper, antiSMASH, RepeatMasker, HADEG, and final report generation. For biologists: NanoPlot summarizes read length and quality; adaptive filtering removes reads that are too short or low quality; Kraken2/KrakenTools help check whether reads match expected taxa; Flye assembles long reads into larger contigs that can span repeats; Racon improves consensus sequence accuracy by polishing with read alignments; QUAST, BUSCO, and CheckM show whether the assembly is contiguous and biologically complete; annotation and screening tools then identify genes, functions, resistance/marker hits, CRISPR systems, secondary metabolite clusters, repeats, hydrocarbon degradation genes, 16S evidence, and ANI-based relatedness.",
+    "category": "wgs_workflows"
+  },
+  {
+    "id": "wgs_hybrid_workflow",
+    "title": "WGS hybrid workflow",
+    "tags": [
+      "wgs_workflows",
+      "wgs",
+      "hybrid",
+      "short reads",
+      "long reads",
+      "unicycler",
+      "nanoplot",
+      "kraken",
+      "assembly",
+      "annotation",
+      "fastani"
+    ],
+    "text": "The WGS hybrid profile combines paired-end short reads and one long-read file. The current step order is: FastQC raw QC, Trimmomatic, Cutadapt, Seqtk, BBDuk, FastQC trimmed QC, Kraken2 short-read classification and extraction, NanoPlot, adaptive decision, adaptive long-read filtering, Kraken2 long-read classification and extraction, Unicycler hybrid assembly, QUAST, BUSCO, CheckM, Prokka, Prodigal, InterProScan, KofamScan, dbCAN, eggNOG-mapper, ABRicate, CCTyper, antiSMASH, RepeatMasker, HADEG, Barrnap 16S, BLAST 16S, FastANI, and final report generation. For biologists: short reads contribute base-level accuracy, long reads help bridge repeats and close gaps, and Unicycler combines both evidence types for isolate genome assembly. The QC and trimming tools check and clean each read type, Kraken2/KrakenTools help verify taxonomic consistency, QUAST/BUSCO/CheckM evaluate the final assembly, and the annotation/screening tools convert contigs into interpretable features such as genes, functions, AMR/marker hits, CRISPR systems, biosynthetic clusters, repeats, degradation genes, 16S evidence, and ANI similarity.",
+    "category": "wgs_workflows"
+  },
+  {
+    "id": "metagenomics_short_workflow",
+    "title": "Metagenomics short-read workflow",
+    "tags": [
+      "metagenomics_workflows",
+      "metagenomics",
+      "short",
+      "fastp",
+      "kneaddata",
+      "metaphlan",
+      "megahit",
+      "metabat2",
+      "maxbin2",
+      "dastool",
+      "checkm2",
+      "gtdbtk",
+      "drep",
+      "coverm",
+      "mag",
+      "salmon"
+    ],
+    "text": "The metagenomics short-read profile uses paired-end R1/R2 reads. The current step order is: fastp, KneadData, MetaPhlAn, MEGAHIT, QUAST, Bowtie2 index, Bowtie2 mapping, depth calculation, MetaBAT2, MaxBin2, contig-to-bin tables, DAS Tool, selected DAS Tool bins, CheckM2, BUSCO, per-MAG QUAST and summary, merged MAG QC, MAG filtering, GTDB-Tk, dRep, CoverM, Barrnap per MAG and summary, Prokka and Prokka summary, CCTyper per MAG and summary, dbCAN per MAG and summary, ABRicate plus summary/finalization, HADEG Proteinortho, filtered-MAG BUSCO, Prodigal on assembly, CD-HIT gene clustering, Salmon index/quantification, MultiQC, and analysis plots. For biologists: fastp and KneadData clean reads and reduce host/background signal; MetaPhlAn estimates community composition; MEGAHIT assembles mixed-community reads into contigs; Bowtie2 and depth calculation show how strongly each contig is supported; MetaBAT2, MaxBin2, and DAS Tool recover candidate MAGs; CheckM2, BUSCO, MetaQUAST, and MAG filtering judge whether MAGs are usable; GTDB-Tk, dRep, and CoverM assign taxonomy, reduce redundancy, and estimate abundance; Prokka, CCTyper, dbCAN, ABRicate, HADEG, Prodigal, CD-HIT, and Salmon add gene/function and abundance interpretation; MultiQC and plots summarize results for review.",
+    "category": "metagenomics_workflows"
+  },
+  {
+    "id": "metagenomics_long_workflow",
+    "title": "Metagenomics long-read workflow",
+    "tags": [
+      "metagenomics_workflows",
+      "metagenomics",
+      "long",
+      "nanostat",
+      "nanoq",
+      "host removal",
+      "metaflye",
+      "medaka",
+      "minimap2",
+      "semibin2",
+      "dastool",
+      "checkm2",
+      "mag",
+      "featurecounts"
+    ],
+    "text": "The metagenomics long-read profile uses long-read data. The current step order is: NanoStat raw summary, nanoq adaptive filtering, host removal, metaFlye/Flye assembly, Medaka polishing, QUAST, Minimap2 mapping, depth calculation, contig filtering by depth, filtered Minimap2 mapping, filtered depth calculation, MetaBAT depth preparation, MetaBAT2, SemiBin2, MetaBAT2 and SemiBin2 contig-to-bin conversion, DAS Tool, selected DAS Tool bins, CheckM2, BUSCO, per-MAG QUAST and summary, merged MAG QC, MAG filtering, dRep, GTDB-Tk, Barrnap per MAG and summary, Prokka and Prokka summary, Prodigal assembly prediction, CD-HIT protein clustering, CCTyper per MAG and summary, dbCAN per MAG and summary, ABRicate plus summary/finalization, HADEG Proteinortho, CoverM, Minimap2 gene mapping, featureCounts gene quantification, MultiQC collection, MultiQC, and analysis plots. For biologists: NanoStat and nanoq describe and clean long reads; host removal reduces non-target background; metaFlye/Flye assembles long reads into contigs; Medaka improves ONT consensus accuracy; Minimap2 and depth tables show read support; MetaBAT2, SemiBin2, and DAS Tool recover MAGs; CheckM2, BUSCO, MetaQUAST, and MAG filtering judge MAG quality; dRep, GTDB-Tk, and CoverM reduce redundancy, assign taxonomy, and estimate abundance; Barrnap, Prokka, Prodigal, CD-HIT, CCTyper, dbCAN, ABRicate, HADEG, and featureCounts convert MAGs and genes into biological interpretation.",
+    "category": "metagenomics_workflows"
+  },
+  {
+    "id": "metagenomics_hybrid_workflow",
+    "title": "Metagenomics hybrid workflow",
+    "tags": [
+      "metagenomics_workflows",
+      "metagenomics",
+      "hybrid",
+      "fastp",
+      "kneaddata",
+      "nanostat",
+      "nanoq",
+      "opera-ms",
+      "megahit",
+      "metabat2",
+      "semibin2",
+      "dastool",
+      "mag",
+      "featurecounts"
+    ],
+    "text": "The metagenomics hybrid profile combines paired-end short reads and long reads. The current step order is: fastp, KneadData, NanoStat raw summary, nanoq adaptive filtering, long-read host removal, MEGAHIT short-read assembly branch, OPERA-MS hybrid metagenome assembly, QUAST, Bowtie2 index, Bowtie2 mapping, Minimap2 mapping, merged BAMs, depth calculation, MetaBAT2, SemiBin2, MetaBAT2 and SemiBin2 contig-to-bin conversion, DAS Tool, selected DAS Tool bins, CheckM2, BUSCO, per-MAG QUAST and summary, merged MAG QC, MAG filtering, GTDB-Tk, dRep, CoverM, Barrnap per MAG and summary, Prokka and Prokka summary, CCTyper per MAG and summary, dbCAN per MAG and summary, ABRicate plus summary/finalization, HADEG Proteinortho, filtered-MAG BUSCO, Prodigal assembly prediction, CD-HIT protein clustering, Bowtie2 gene mapping, featureCounts gene quantification, MultiQC, and analysis plots. For biologists: fastp/KneadData clean short reads, NanoStat/nanoq clean long reads, MEGAHIT provides a short-read assembly branch, and OPERA-MS combines short- and long-read evidence for hybrid metagenome assembly. Bowtie2, Minimap2, merged BAMs, and depth tables quantify read support; MetaBAT2, SemiBin2, and DAS Tool reconstruct MAGs; CheckM2/BUSCO/MetaQUAST assess MAG quality; GTDB-Tk, dRep, and CoverM provide taxonomy, representative genomes, and abundance; annotation and screening tools then describe genes, functions, CRISPR systems, CAZymes, AMR/marker hits, degradation genes, and gene-level counts.",
+    "category": "metagenomics_workflows"
+  },
+  {
+    "id": "metagenomics_advanced_settings",
+    "title": "Metagenomics advanced pipeline settings",
+    "tags": [
+      "metagenomics_workflows",
+      "metagenomics",
+      "advanced settings",
+      "pipeline config",
+      "fastp",
+      "megahit",
+      "kraken2",
+      "bracken",
+      "viral",
+      "semibin",
+      "gunc",
+      "quality thresholds",
+      "drep",
+      "annotation modules"
+    ],
+    "text": "Metagenomics profiles include optional advanced settings for users who need more control. fastp settings adjust short-read quality trimming, minimum read length, low-complexity filtering, and front/tail trimming; this helps remove weak reads before assembly. MEGAHIT minimum contig length controls how short assembled contigs must be before they are retained. Kraken2 confidence and hit-group settings control how strict taxonomic read classification should be, while Bracken settings control abundance re-estimation by read length, taxonomic level, and threshold. Viral settings tune viral contig detection sensitivity. SemiBin and GUNC settings influence binning and contamination checks. MAG quality thresholds define acceptable completeness and contamination. dRep settings tune dereplication stringency using ANI, aligned fraction, completeness, and contamination. Annotation toggles allow Prokka, CCTyper, dbCAN, ABRicate, HADEG, and filtered-MAG BUSCO modules to be enabled or disabled when appropriate. Values are checked before submission so unrealistic settings are rejected early.",
+    "category": "metagenomics_workflows"
+  },
+  {
+    "id": "tool_reference_annotation_general",
+    "title": "Genome and gene annotation tools: Prokka, Prodigal, Barrnap, InterProScan, KofamScan, eggNOG-mapper and dbCAN",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "prokka",
+      "prodigal",
+      "barrnap",
+      "interproscan",
+      "kofamscan",
+      "kofam",
+      "eggnog",
+      "eggnog-mapper",
+      "dbcan",
+      "annotation",
+      "genes",
+      "proteins",
+      "rrna",
+      "cazyme"
+    ],
+    "text": "Prodigal predicts protein-coding genes in microbial assemblies and metagenome assemblies. Prokka combines gene prediction and annotation into standard microbial genome files such as GFF, GBK, FAA, and FNA. Barrnap detects rRNA genes, including 16S rRNA, which can support taxonomy checks. InterProScan compares proteins to domain and family databases to identify conserved functional regions. KofamScan assigns KEGG Orthology identifiers using profile HMMs, helping connect genes to pathways. eggNOG-mapper assigns orthology and functional descriptions based on eggNOG groups. dbCAN identifies carbohydrate-active enzymes such as glycoside hydrolases and polysaccharide lyases. For biologists, these tools turn anonymous contigs into named genes, proteins, pathways, and functional hypotheses.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_assembly_polishing",
+    "title": "Assembly and polishing tools: SPAdes, Flye, MEGAHIT, OPERA-MS, Unicycler, Racon and Medaka",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "spades",
+      "flye",
+      "megahit",
+      "opera-ms",
+      "unicycler",
+      "racon",
+      "medaka",
+      "assembly",
+      "polishing",
+      "contigs"
+    ],
+    "text": "SPAdes assembles paired-end short reads from isolate WGS into contigs using graph-based assembly. Flye and metaFlye assemble long reads by resolving overlaps and repeats, producing more contiguous assemblies when read length is sufficient. MEGAHIT assembles short-read metagenomes efficiently, which is useful for complex community samples. OPERA-MS performs hybrid metagenome assembly by combining short-read accuracy with long-read linking information. Unicycler performs hybrid isolate WGS assembly using short and long reads together. Racon polishes assemblies by aligning reads back to contigs and correcting consensus errors. Medaka polishes ONT assemblies using a neural-network model. For biologists, assembly turns millions of reads into longer biological sequences; polishing improves confidence before gene prediction, taxonomy, or functional interpretation.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_binning_mag",
+    "title": "MAG binning and refinement tools: MetaBAT2, MaxBin2, SemiBin2 and DAS Tool",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "metabat2",
+      "maxbin2",
+      "semibin2",
+      "das tool",
+      "dastool",
+      "mag",
+      "binning",
+      "contig2bin"
+    ],
+    "text": "MetaBAT2 groups metagenomic contigs into bins using coverage patterns and sequence composition. MaxBin2 uses abundance, composition, and marker-gene information to produce alternative bins. SemiBin2 uses self-supervised learning to improve binning from contig and coverage features. DAS Tool compares outputs from multiple binners and selects a non-redundant consensus set. Contig-to-bin tables are intermediate mapping files that tell DAS Tool which contig belongs to which candidate bin. For biologists, binning is the step that reconstructs draft genomes from a mixed community sample; these draft genomes are called MAGs. Because no single binner is perfect, using multiple approaches and consensus selection can improve confidence.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_decontamination_taxonomy",
+    "title": "Decontamination and taxonomic profiling tools: KneadData, Kraken2, KrakenTools and MetaPhlAn",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "kneaddata",
+      "kraken2",
+      "krakentools",
+      "metaphlan",
+      "taxonomy",
+      "classification",
+      "host removal",
+      "decontamination"
+    ],
+    "text": "KneadData is used mainly in metagenomics profiles to remove host or contaminant reads by comparing reads against configured reference sequences. This prevents a microbial community result from being dominated by unwanted background DNA. Kraken2 classifies reads by matching short sequence patterns, called k-mers, against a taxonomic database. KrakenTools helps extract reads or summarize classifications from Kraken2 output. MetaPhlAn estimates microbial community composition using clade-specific marker genes rather than classifying every read. For biologists, these tools answer practical questions: is my sample dominated by the expected organisms, is there contamination or host carryover, and what community members are present before assembly or MAG recovery?",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_gene_catalog_quantification",
+    "title": "Gene catalogue and quantification tools: CD-HIT, Salmon and featureCounts",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "cd-hit",
+      "cdhit",
+      "salmon",
+      "featurecounts",
+      "gene catalogue",
+      "quantification",
+      "abundance"
+    ],
+    "text": "CD-HIT clusters nucleotide or protein sequences to reduce redundancy and build non-redundant gene or protein catalogues from metagenomic assemblies. Salmon quantifies short-read abundance against a gene catalogue or transcript-like reference using lightweight indexing and probabilistic assignment. featureCounts counts reads overlapping predicted gene features from alignment files. Minimap2 or Bowtie2 alignments can feed gene quantification depending on read type. For biologists, these tools move beyond presence/absence and ask: which genes are present, how redundant is the catalogue, and which genes have read support or higher abundance in the sample? Outputs include clustered FASTA files, cluster tables, abundance matrices, count tables, and logs.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_internal_outputs",
+    "title": "Internal GENOCULAR outputs: final report, manifest, analysis plots and artifact explorer",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "final report",
+      "manifest",
+      "analysis plots",
+      "artifact explorer",
+      "outputs",
+      "results"
+    ],
+    "text": "The final report and manifest are GENOCULAR-generated outputs rather than third-party analysis tools. The final report consolidates important result links and summaries for the completed job. The manifest records generated artifacts so the platform can expose results reliably. Analysis plots are generated after pipeline execution to support the analysis page and summarize selected outputs visually. The artifact explorer uses the manifest/result listing to organize files by folder/category, open reports, select files, and download ZIP bundles. These outputs are needed because raw tool directories can be difficult to navigate; GENOCULAR adds a structured result layer for users.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_mag_qc_taxonomy_abundance",
+    "title": "MAG quality, taxonomy, dereplication and abundance tools: CheckM, CheckM2, BUSCO, MetaQUAST, GTDB-Tk, dRep and CoverM",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "checkm",
+      "checkm2",
+      "busco",
+      "metaquast",
+      "gtdbtk",
+      "gtdb-tk",
+      "drep",
+      "coverm",
+      "mag qc",
+      "taxonomy",
+      "abundance"
+    ],
+    "text": "CheckM and CheckM2 estimate MAG completeness and contamination by checking marker genes expected in microbial genomes. BUSCO estimates completeness using conserved single-copy orthologs and is useful for assemblies and MAGs. QUAST and MetaQUAST summarize assembly structure, including contig count, total length, N50, and other quality metrics. GTDB-Tk assigns MAG taxonomy using the Genome Taxonomy Database workflow and marker-gene phylogeny. dRep dereplicates similar genomes or MAGs so highly similar bins do not inflate the final genome set. CoverM estimates MAG abundance by mapping reads and calculating coverage. For biologists, these tools help decide whether a recovered MAG is complete enough, clean enough, taxonomically interpretable, non-redundant, and abundant enough to support biological conclusions.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_mapping_depth",
+    "title": "Mapping and depth tools: Bowtie2, Minimap2, depth calculation and BAM merging",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "bowtie2",
+      "minimap2",
+      "mapping",
+      "bam",
+      "depth",
+      "coverage",
+      "merge bams"
+    ],
+    "text": "Bowtie2 maps short reads back to assemblies or gene catalogues by building an index and aligning paired-end reads efficiently. Minimap2 maps long reads to assemblies or gene catalogues and is designed for long, error-prone reads. Depth calculation converts alignments into coverage values: how many reads support each contig, MAG, or gene. BAM merging combines short-read and long-read alignments in hybrid workflows so coverage evidence can be interpreted together. For biologists, mapping and depth show whether an assembled contig or gene is actually supported by the sequencing reads, which is important for binning, abundance estimation, contig filtering, and gene quantification.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_read_filtering",
+    "title": "Read trimming and filtering tools: fastp, Trimmomatic, Cutadapt, Seqtk, BBDuk and nanoq",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "fastp",
+      "trimmomatic",
+      "cutadapt",
+      "seqtk",
+      "bbduk",
+      "nanoq",
+      "trimming",
+      "filtering",
+      "adapters"
+    ],
+    "text": "fastp performs fast short-read preprocessing: it detects adapters, trims low-quality bases, removes reads that are too short, and produces HTML/JSON QC reports. Trimmomatic performs rule-based short-read trimming using sliding windows, quality thresholds, adapter clipping, and minimum length rules. Cutadapt removes known adapter, primer, or linker sequences that can interfere with assembly or profiling. Seqtk performs lightweight FASTQ manipulation and simple trimming/filtering. BBDuk uses k-mer matching to remove adapters, contaminants, or low-quality sequence content. nanoq filters long reads by length and quality. For biologists, these steps are equivalent to cleaning the sequencing data before interpretation: poor bases, adapters, host/background reads, or very short fragments can fragment assemblies, distort taxonomic profiles, and create false downstream hits.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_read_qc",
+    "title": "Read QC tools: FastQC, NanoPlot, NanoStat and MultiQC",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "fastqc",
+      "nanoplot",
+      "nanostat",
+      "multiqc",
+      "qc",
+      "quality control",
+      "read quality"
+    ],
+    "text": "FastQC is used for short-read quality assessment. It reads FASTQ files and checks per-base quality, per-sequence quality, GC content, adapter signal, duplication, and overrepresented sequences. For biologists, this answers: did the sequencing run produce clean reads, and did trimming improve them? NanoPlot and NanoStat are used for long-read datasets. They summarize read length, quality score distribution, total yield, and read N50-like statistics, which helps judge whether ONT/Nanopore reads are long and clean enough for assembly. MultiQC collects reports from tools such as FastQC, fastp, QUAST, and other modules into one HTML report. It does not replace the individual tools; it makes review easier by putting quality metrics in one place.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_snakemake",
+    "title": "Workflow engine: Snakemake",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "snakemake",
+      "workflow engine",
+      "pipeline execution",
+      "rules",
+      "dag",
+      "reproducibility"
+    ],
+    "text": "Snakemake is the workflow engine used to run the bioinformatics pipelines in a reproducible order. Each pipeline step is represented as a rule with declared input files, output files, parameters, logs, and commands. Snakemake builds a dependency graph from these rules, decides which steps are needed for the selected WGS or metagenomics profile, runs independent steps when resources allow, and stops clearly when a required input or tool command fails. For biologists, this means the analysis is not a loose set of manual commands; it is a traceable workflow where QC, trimming, assembly, annotation, reporting, and other modules run in the intended order with logs for troubleshooting.",
+    "category": "tool_reference"
+  },
+  {
+    "id": "tool_reference_specialized_screening",
+    "title": "Specialized screening tools: ABRicate, CCTyper, CRISPRCasFinder, antiSMASH, HADEG, BLAST 16S and FastANI",
+    "tags": [
+      "tool_reference",
+      "tools",
+      "abricate",
+      "cctyper",
+      "crisprcasfinder",
+      "crispr",
+      "antismash",
+      "hadeg",
+      "blast",
+      "blast 16s",
+      "fastani",
+      "amr",
+      "virulence",
+      "secondary metabolite",
+      "ani"
+    ],
+    "text": "ABRicate screens assemblies against configured gene databases, commonly for antimicrobial resistance, virulence, plasmid, or other marker genes depending on installed databases. CCTyper and CRISPRCasFinder detect CRISPR arrays and Cas systems, which relate to bacterial adaptive immunity and phage defense. antiSMASH predicts biosynthetic gene clusters such as NRPS, PKS, and other secondary metabolite loci; these are candidates for further biological validation. HADEG screens for hydrocarbon degradation-associated genes or orthologs when that module is enabled. BLAST 16S compares extracted 16S rRNA sequences against reference databases for taxonomic similarity. FastANI estimates average nucleotide identity between genomes and references, supporting species-level relatedness checks in isolate WGS. For biologists, these tools answer phenotype-oriented questions: what resistance markers, defense systems, biosynthetic potential, degradation functions, taxonomy signals, or close genome relatives are suggested by the sequence data?",
+    "category": "tool_reference"
+  },
+  {
+    "id": "annotation_outputs",
+    "title": "Genome annotation outputs",
+    "tags": [
+      "results_and_interpretation",
+      "annotation",
+      "genes",
+      "proteins",
+      "gbk",
+      "gff",
+      "features"
+    ],
+    "text": "After assembly, GENOCULAR runs an annotation step to identify genes and other genomic features. Typical outputs include: (1) annotated GenBank-style files (e.g., .gbk) containing contigs with gene features; (2) GFF files describing genomic coordinates and feature types; and (3) FASTA files of predicted proteins and/or coding sequences. These outputs can be opened in genome browsers or downstream analysis tools to explore gene content, function, and genomic context.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "assembly_report",
+    "title": "Assembly statistics and interpreting N50",
+    "tags": [
+      "results_and_interpretation",
+      "assembly",
+      "contigs",
+      "N50",
+      "L50",
+      "genome size"
+    ],
+    "text": "The assembly report summarizes how your reads were assembled into contigs. Important metrics include: total number of contigs, maximum contig length, N50, L50, and total assembled size. A good microbial assembly typically has a total size close to the expected genome size, a relatively small number of large contigs, and a reasonably high N50. However, a very high N50 with an incorrect total size can indicate mis-assembly, while many tiny contigs with low N50 usually reflect low coverage, poor read quality, or mixed samples.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "crispr_results",
+    "title": "CRISPR and Cas results",
+    "tags": [
+      "results_and_interpretation",
+      "crispr",
+      "cas",
+      "crisprcasfinder",
+      "defense systems"
+    ],
+    "text": "GENOCULAR runs a CRISPR detection module (for example, CRISPRCasFinder) to identify CRISPR arrays and, where possible, associated Cas proteins. The CRISPR summary file lists identified CRISPR loci, repeat sequences, and spacers, along with basic metrics such as array length and position on the contig. If Cas models are available, the pipeline may also report predicted CRISPR-Cas systems. Absence of reported CRISPRs does not necessarily mean the organism lacks any defense systems; it may also reflect incomplete assemblies or borderline detection scores.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "download_results",
+    "title": "Downloading results",
+    "tags": [
+      "results_and_interpretation",
+      "download",
+      "results",
+      "reports",
+      "final outputs"
+    ],
+    "text": "When a job reaches done, GENOCULAR exposes downloadable result files. WGS outputs usually include read QC, assembly FASTA, annotation files, assembly QC, screening tables, 16S/ANI summaries, logs, and a final report. Metagenomics outputs can include QC/MultiQC, assemblies, mapping/depth tables, bins/MAGs, CheckM2/BUSCO/MetaQUAST summaries, GTDB-Tk taxonomy, dRep dereplicated genomes, CoverM abundance, MAG annotations, gene catalogue or gene quantification outputs, analysis plots, logs, and final organized artifact indexes. For long-term storage, download key reports, FASTA files, annotation tables, and QC summaries.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "multiqc_report",
+    "title": "MultiQC and QC report interpretation",
+    "tags": [
+      "results_and_interpretation",
+      "qc",
+      "multiqc",
+      "report",
+      "fastqc"
+    ],
+    "text": "GENOCULAR aggregates QC information into a consolidated report (for example, MultiQC-style HTML) so you can quickly assess read quality and basic assembly metrics. In this report, look for: (1) per-base quality plots where most of the distribution is in the \"good\" (green) range; (2) GC content roughly matching what is expected for your organism; (3) no strong overrepresented sequences, which might indicate adapters or contamination; and (4) any warnings or failures highlighted by the QC tools. Poor QC metrics often explain downstream assembly or annotation problems.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "qc_metrics_overview",
+    "title": "QC metrics overview",
+    "tags": [
+      "results_and_interpretation",
+      "qc",
+      "quality",
+      "multiqc",
+      "coverage",
+      "N50",
+      "GC"
+    ],
+    "text": "QC metrics summarize the quality of your reads and assembly. Raw read QC may include per-base quality scores, per-sequence quality, GC content, and adapter/contamination checks. Coverage refers to how many times, on average, each base of the genome is sequenced (e.g., 80x coverage). Assembly statistics summarize the contig sizes and structure. N50 is the contig length such that 50% of the assembly is contained in contigs of that length or longer. A higher N50 generally indicates a more contiguous assembly, but it should be interpreted together with total assembly size, number of contigs, coverage, and biological expectations for the organism.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "result_explorer",
+    "title": "Using the result explorer",
+    "tags": [
+      "results_and_interpretation",
+      "results",
+      "artifact explorer",
+      "download",
+      "reports",
+      "visual outputs"
+    ],
+    "text": "The Jobs and analysis pages expose organized result browsing after final outputs are published. GENOCULAR generates structured result indexes so the interface can group artifacts by folder/category, open reports, select files, and download ZIP bundles. During execution, users should expect status and step progress to update; final result artifacts appear when the workflow has completed and outputs have been organized. Very large result sets may require filtering by folder or search so the browser remains responsive.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "secondary_metabolites",
+    "title": "Secondary metabolite cluster prediction (antiSMASH-like)",
+    "tags": [
+      "results_and_interpretation",
+      "secondary metabolites",
+      "biosynthetic gene clusters",
+      "antismash"
+    ],
+    "text": "The pipeline includes a module for predicting secondary metabolite biosynthetic gene clusters (similar to antiSMASH). This analysis scans the annotated genome for signatures of well-known biosynthetic gene cluster families (such as NRPS, PKS, and others). The output is usually an HTML report plus auxiliary files, showing predicted clusters, domain architectures, and similarity to known reference clusters. These predictions are computational and should be interpreted as candidates for experimental validation rather than definitive calls.",
+    "category": "results_and_interpretation"
+  },
+  {
+    "id": "email_notifications",
+    "title": "Email notifications for job status",
+    "tags": [
+      "job_operations",
+      "email",
+      "notifications",
+      "job submitted",
+      "job finished"
+    ],
+    "text": "Email notifications are optional. If a user supplies an address for a job, the submission email confirms that the data was queued and includes a private read-only job link; the owner link shown in the browser is not emailed. Later status notifications do not repeat the access key, so account-free users should retain the original submission email or downloaded recovery file. Leave the email field blank to submit without providing an address.",
+    "category": "job_operations"
+  },
+  {
+    "id": "job_status_states",
+    "title": "Understanding job status",
+    "tags": [
+      "job_operations",
+      "status",
+      "queued",
+      "running",
+      "done",
+      "failed",
+      "cancelled",
+      "progress",
+      "queue"
+    ],
+    "text": "GENOCULAR job states are: queued, running, done, failed, cancelled, and unknown. queued means the job is waiting for an available execution slot. running means the workflow is actively processing data and step progress should update. done means the workflow completed successfully and final downloads should be visible. failed means a tool or workflow stage exited with an error; inspect the failed step and logs. cancelled means a user or administrator requested cancellation, or the platform safely closed a stale running view. The status page combines live progress, step summaries, and terminal job state so users are not left with misleading outdated statuses.",
+    "category": "job_operations"
+  },
+  {
+    "id": "making_jobs_faster",
+    "title": "How to make GENOCULAR jobs faster",
+    "tags": [
+      "job_operations",
+      "faster",
+      "speed",
+      "slow",
+      "runtime",
+      "performance",
+      "queue",
+      "optimize"
+    ],
+    "text": "GENOCULAR runtime depends on data size, read depth, selected profile, queue load, and the heaviest tools in that profile. To make jobs faster: choose the simplest correct profile, avoid hybrid mode unless long and short reads are both needed, avoid uploading unnecessarily huge over-sequenced files, remove obvious wrong files before submission, use clean compressed FASTQ files, and check queue position before assuming the job is stuck. Metagenomics MAG workflows are usually much heavier than isolate WGS because they include assembly, mapping, binning, MAG QC, taxonomy, annotation, abundance, and report generation.",
+    "category": "job_operations"
+  },
+  {
+    "id": "performance_and_limits",
+    "title": "Performance and resource limits",
+    "tags": [
+      "job_operations",
+      "runtime",
+      "limits",
+      "queue",
+      "timeout",
+      "metagenomics",
+      "wgs",
+      "large files"
+    ],
+    "text": "Runtime depends on profile, input size, read depth, community complexity, server load, and heavy biological modules such as assembly, polishing, binning, CheckM2, GTDB-Tk, dRep, CoverM, dbCAN, antiSMASH, and HADEG/Proteinortho. Microbial isolate WGS jobs are usually lighter than metagenomics MAG workflows. Metagenomics long and hybrid profiles are the heaviest because they combine assembly, mapping/depth, binning, MAG QC, taxonomy, dereplication, annotation, abundance, gene quantification, MultiQC, and plots. Practical runtime and storage retention depend on deployment configuration. Very large or over-sequenced files can add runtime without improving biological conclusions.",
+    "category": "job_operations"
+  },
+  {
+    "id": "view_logs",
+    "title": "Viewing pipeline logs",
+    "tags": [
+      "job_operations",
+      "logs",
+      "steps",
+      "status",
+      "debugging",
+      "progress"
+    ],
+    "text": "GENOCULAR writes live progress for each job, including overall status and step-wise progress used by the UI rail. These records show the current state, message, completed step count, total step count, and step-level details. Tool logs are also available in the job log area or result folders when produced. Logs are the first place to check when a job is queued too long, running in a heavy module, failed, or cancelled. When reporting an issue, include the job ID and the current status message or failing step name.",
+    "category": "job_operations"
+  },
+  {
+    "id": "architecture_showcase_novelty",
+    "title": "Architecture showcase: novelty and user-facing strengths",
+    "tags": [
+      "architecture_showcase",
+      "architecture",
+      "novelty",
+      "showcase",
+      "state of the art",
+      "professional summary"
+    ],
+    "text": "GENOCULAR is novel in the way it brings isolate WGS and metagenomics analysis into the same guided platform while keeping the user experience simple for biologists. The platform is profile-aware: selecting WGS short, WGS long, WGS hybrid, metagenomics short, metagenomics long, or metagenomics hybrid automatically changes required inputs, workflow path, progress visualization, expected outputs, and downstream interpretation. It provides traceability from raw FASTQ upload to job metadata, progress records, final artifacts, and reports. It makes complex multi-stage analysis more accessible through step-wise progress, organized downloads, reusable uploaded files, integrated result visualization, and administrator visibility. A humble way to present the work is: GENOCULAR combines established bioinformatics tools with a practical, reproducible, user-oriented architecture that reduces manual command-line burden and helps biologists interpret microbial sequencing data more confidently.",
+    "category": "architecture_showcase"
+  },
+  {
+    "id": "architecture_showcase_platform_capabilities",
+    "title": "Architecture showcase: platform capabilities",
+    "tags": [
+      "architecture_showcase",
+      "architecture",
+      "showcase",
+      "platform",
+      "capabilities",
+      "novelty",
+      "state of the art"
+    ],
+    "text": "GENOCULAR is designed as an end-to-end microbial analysis platform rather than a single script wrapper. The platform connects private account-free data upload, profile-aware job submission, automated workflow execution, live progress tracking, optional account history, organized artifact browsing, downloadable reports, and analysis-ready visual outputs in one place. Its architecture separates user interaction, job orchestration, workflow execution, status reporting, result organization, and administrative monitoring, so each layer can be maintained or improved without disrupting the full system. For a showcase, the key message is that biologists can move from raw sequencing files to interpretable genome or metagenome outputs through a guided, traceable, and reproducible interface.",
+    "category": "architecture_showcase"
+  },
+  {
+    "id": "about_creators",
+    "title": "Who are the people involved in GENOCULAR?",
+    "tags": [
+      "project_team",
+      "creator",
+      "contributors",
+      "project team",
+      "who created the pipeline",
+      "about",
+      "lab",
+      "principal investigator",
+      "director"
+    ],
+    "text": "GENOCULAR was developed as a collaborative project at the Computational Biology and Bioinformatics Laboratory, BRIC-Institute of Life Sciences, Bhubaneswar. Key contributors include: Rasmi Rekha Samal, who developed the Snakemake-based bioinformatics pipelines; Bineet Kumar Mohanta, who developed the server architecture and deployed the pipelines on the platform; Rory Mishra, who contributed to preparation of the analysis plots; Dr. Anshuman Dixit, Principal Investigator; and Dr. Debasis Dash, Director, BRIC-Institute of Life Sciences. The project combines workflow development, server engineering, visualization, and scientific leadership to make microbial WGS and metagenomics analysis more accessible to users.",
+    "category": "project_team"
+  },
+  {
+    "id": "faq_can_i_edit_resubmit_job",
+    "title": "Can I edit, resume, or rerun a job instead of submitting a new one?",
+    "tags": [
+      "faq",
+      "rerun",
+      "resume",
+      "edit job",
+      "resubmit",
+      "immutable jobs"
+    ],
+    "text": "GENOCULAR jobs remain immutable after submission. Users should submit a fresh job to change the profile, inputs, sample name, or metagenomics settings. An authorized administrator can retry a failed job on its owner's behalf from the admin panel when its raw FASTQ files are still retained. The retry receives a new job ID, keeps the original tenant and user ownership, reuses the retained inputs, and records its link to the failed job for auditing; it is never an in-place resume. Cancelled or completed jobs cannot be retried through this control.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_can_i_run_multiple_jobs",
+    "title": "Can I run more than one job at the same time?",
+    "tags": [
+      "faq",
+      "multiple jobs",
+      "concurrent jobs",
+      "run in parallel",
+      "queue multiple samples",
+      "several samples"
+    ],
+    "text": "Yes, you can submit multiple jobs and they'll queue up; whether they run strictly one-after-another or overlap depends on server load and any per-user concurrency limits in place. If you have several samples, submitting them as separate jobs with clear, distinct sample names is the normal workflow - there's no need to wait for one to finish before submitting the next. If everything seems to sit in 'queued' for a long time, that's usually queue depth rather than a stuck submission.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_close_tab_or_lose_internet",
+    "title": "What happens if I close the browser tab or lose internet while a job is running?",
+    "tags": [
+      "faq",
+      "browser closed",
+      "internet lost",
+      "upload interrupted",
+      "job continues"
+    ],
+    "text": "After submission, the job runs on the server independently of the browser. Closing the tab or losing internet does not stop a queued or running workflow. The vulnerable phase is upload: if the tab is closed or refreshed before upload and submission finish, the client-side upload can be interrupted and may need to be restarted. Once a job ID exists, users can safely return later to check progress from the Jobs page.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_file_size_practical",
+    "title": "How big can my FASTQ files be?",
+    "tags": [
+      "faq",
+      "file size limit",
+      "large files",
+      "max upload size",
+      "how big",
+      "too large"
+    ],
+    "text": "There isn't a fixed one-size-fits-all number quoted here because it depends on server configuration and current load, but as a practical guide: typical isolate WGS short-read datasets (a few hundred MB to a couple GB per file, gzipped) run smoothly, while very large or extremely over-sequenced files mostly add runtime without adding useful information for a microbial genome. If an upload stalls or fails outright on a large file, it's worth checking your connection stability first, then asking the administrator about configured upload limits.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_general_data_privacy_curious",
+    "title": "Does anyone else see my data or results?",
+    "tags": [
+      "faq",
+      "privacy",
+      "who can see my data",
+      "shared data",
+      "confidential",
+      "other users"
+    ],
+    "text": "Jobs and results are private and are not publicly browsable. Each submission receives a high-entropy private owner link; the access key is held in the URL fragment, sent to the API in an authorization header, and stored by the server only as a keyed digest. Owners can create revocable read-only links for people they authorize. Optional accounts are used only for conveniences such as cross-device history. Authorized administrators may access stored data for operation and support. Users should treat private links like passwords and review the service retention policy before submitting sensitive or unpublished data.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_low_completeness_high_contamination",
+    "title": "My MAG has low completeness or high contamination - what does that mean?",
+    "tags": [
+      "faq",
+      "low completeness",
+      "high contamination",
+      "mag quality",
+      "bad bin",
+      "checkm2 contamination"
+    ],
+    "text": "Low completeness usually means the binning process didn't recover enough of that organism's genome - often due to low abundance in the sample, insufficient sequencing depth, or the organism being closely related to others and getting its contigs split across multiple bins. High contamination means contigs from more than one organism likely ended up in the same bin, which happens more often with closely related strains or when coverage/composition signals overlap between organisms. Neither is a pipeline error by itself - it reflects real limits of assembly and binning on complex communities. Community standards (MIMAG) generally call a MAG 'high quality' around >90% completeness and <5% contamination, medium quality lower than that but still usable with caveats.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_mobile_browser_support",
+    "title": "Can I use GENOCULAR from my phone or tablet?",
+    "tags": [
+      "faq",
+      "mobile",
+      "phone",
+      "tablet",
+      "browser support",
+      "responsive"
+    ],
+    "text": "The interface is built as a standard web app and will generally load on mobile browsers, but uploading large FASTQ files and browsing large result sets is a much better experience on a desktop or laptop with a stable connection. Monitoring a job's status or reading a finished report on your phone works fine in a pinch; doing the initial upload and submission of a big sequencing dataset over mobile data is not recommended.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_reuse_or_compare_jobs",
+    "title": "Can I compare results between two of my jobs?",
+    "tags": [
+      "faq",
+      "compare jobs",
+      "compare samples",
+      "multiple samples",
+      "batch",
+      "side by side"
+    ],
+    "text": "GENOCULAR runs and reports jobs individually rather than generating an automatic side-by-side comparison across jobs. To compare two samples, run each through the same profile, then download the relevant reports (assembly stats, taxonomy, ABRicate/AMR tables, GTDB-Tk taxonomy, CoverM abundance, etc.) and compare them yourself in a spreadsheet or downstream tool. Keeping job/sample names consistent and descriptive makes this much easier later, since you'll be matching files by sample name rather than job ID once they're downloaded.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_stuck_in_queue",
+    "title": "My job has been queued or running for a long time - is something wrong?",
+    "tags": [
+      "faq",
+      "stuck queue",
+      "queued forever",
+      "not starting",
+      "long wait",
+      "job not running",
+      "running too long"
+    ],
+    "text": "A long queued state usually means other jobs are ahead, especially heavy metagenomics MAG jobs. A long running state can be normal in assembly, binning, CheckM2, GTDB-Tk, dRep, CoverM, dbCAN, antiSMASH, or HADEG/Proteinortho, but it should still show progress or logs. If the system appears idle or a running step shows no progress for an unusually long time, send the administrator the job ID. Administrators can compare user-visible status, job history, workflow logs, and active execution state before declaring the job stuck.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_what_is_a_mag_plain",
+    "title": "What is a MAG, in plain terms?",
+    "tags": [
+      "faq",
+      "mag",
+      "metagenome assembled genome",
+      "what is a mag",
+      "bin",
+      "explain mag"
+    ],
+    "text": "A MAG (metagenome-assembled genome) is a genome reconstructed from a mixed community sample rather than from an isolated pure culture. Instead of sequencing one organism, metagenomics sequences everything in the sample at once, assembles all the DNA together, and then bins the resulting contigs into groups that likely came from the same organism based on coverage and sequence composition. A MAG is therefore a best estimate of one organism's genome pulled out of that mixture - it's rarely 100% complete or perfectly clean, which is why completeness and contamination scores (from CheckM2/BUSCO) matter so much when judging whether a MAG is usable.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_what_is_coverage_good_value",
+    "title": "What coverage do I need for a good assembly?",
+    "tags": [
+      "faq",
+      "coverage",
+      "depth",
+      "how much coverage",
+      "30x",
+      "50x",
+      "80x",
+      "sequencing depth"
+    ],
+    "text": "For microbial isolate WGS, 50-100x average coverage is usually comfortable for short-read assembly with SPAdes; below 20-30x you start seeing fragmented assemblies and lower BUSCO/CheckM completeness, especially for larger or repeat-rich genomes. Long-read assembly with Flye can work with lower coverage (30-50x) because long reads resolve repeats better, but polishing accuracy still benefits from higher depth. Hybrid mode tolerates moderate short-read coverage since long reads carry a lot of the structural resolution. There's no single hard cutoff - it depends on genome size, repeat content, and how clean the reads are. If your assembly looks fragmented, check coverage before blaming the pipeline.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_what_organism_should_expect_genome_size",
+    "title": "How do I know if my assembled genome size looks right?",
+    "tags": [
+      "faq",
+      "genome size",
+      "expected size",
+      "too big",
+      "too small",
+      "is this normal"
+    ],
+    "text": "Compare your total assembly size against the known/expected genome size for that organism or its closest relatives - most bacterial genomes fall roughly between 1-10 Mb depending on lineage, with plenty of well-studied species clustering more tightly than that. An assembly noticeably larger than expected can indicate contamination, an unresolved mixed sample, or heavy fragmentation inflating apparent size; noticeably smaller can indicate low coverage, aggressive trimming, or a genuinely reduced-genome organism. This is exactly why assembly size is interpreted alongside N50, contig count, and coverage rather than on its own.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_why_different_tools_disagree",
+    "title": "Why do different tools give slightly different numbers for the same thing?",
+    "tags": [
+      "faq",
+      "disagreement",
+      "different results",
+      "inconsistent",
+      "tool differences",
+      "conflicting numbers"
+    ],
+    "text": "It's normal for tools that measure similar things to not match exactly. CheckM, CheckM2 and BUSCO all estimate genome/MAG completeness but use different marker sets and statistical models, so a genome might show 98% with one and 95% with another - both can be reasonable. Similarly, taxonomy from Kraken2 (k-mer based) can differ from GTDB-Tk (marker-gene phylogeny based) or MetaPhlAn (clade markers), especially near the species boundary or for poorly represented taxa in reference databases. Treat these as complementary estimates rather than contradictions. If two tools disagree by a wide margin (not a few percent), that's worth a closer look at the underlying assembly or bin quality rather than assuming one tool is simply wrong.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_wrong_organism_result",
+    "title": "The taxonomy result doesn't match what I expected - what do I check?",
+    "tags": [
+      "faq",
+      "wrong species",
+      "unexpected taxonomy",
+      "misidentified",
+      "taxonomy mismatch",
+      "not what i expected"
+    ],
+    "text": "First check assembly quality - a poor or contaminated assembly can genuinely mislead taxonomic tools. Then check whether the classification came from Kraken2 (fast k-mer based, sensitive to database content), FastANI/BLAST 16S (reference comparison), or GTDB-Tk (marker-gene phylogeny in metagenomics) - these methods can disagree, especially for novel or under-represented taxa that aren't well covered in reference databases. Sample handling issues (mixed culture, mislabeled tube, cross-contamination during extraction) are also a real possibility worth ruling out on the laboratory side if the mismatch is large and assembly QC looks fine otherwise.",
+    "category": "faq"
+  },
+  {
+    "id": "faq_zero_crispr_or_no_amr_hits",
+    "title": "The CRISPR or AMR screen came back empty - is that a bug?",
+    "tags": [
+      "faq",
+      "no crispr found",
+      "no amr hits",
+      "empty results",
+      "zero hits",
+      "nothing detected"
+    ],
+    "text": "No, an empty result from CRISPRCasFinder/CCTyper or ABRicate usually just means the screened database didn't find a match above its detection threshold in your assembly - not that the tool failed. Many bacteria simply don't carry CRISPR-Cas systems, and plenty of genomes carry no acquired resistance genes in the databases GENOCULAR uses. Check the job log to confirm the step actually ran and finished (rather than being skipped due to an earlier failure), and check assembly completeness - a fragmented or partial assembly can genuinely miss a locus that's split across a contig break.",
+    "category": "faq"
+  },
+  {
+    "id": "data_handling",
+    "title": "How GENOCULAR handles your data",
+    "tags": [
+      "support",
+      "data",
+      "privacy",
+      "storage",
+      "retention",
+      "access control"
+    ],
+    "text": "GENOCULAR stores uploaded FASTQ files, live job progress, and completed outputs in controlled server-side storage. Access is restricted by per-job owner or read-only capabilities, or by an optional linked account; authorized administrators can inspect jobs for maintenance and support. The server stores capability digests rather than raw access keys. Storage cleanup policies remove older raw data, logs, result objects, and expired access after configured retention windows, so users should retain their private link during the access period and download critical outputs for long-term retention.",
+    "category": "support"
+  },
+  {
+    "id": "error_missing_r1",
+    "title": "Error: Missing R1 file",
+    "tags": [
+      "support",
+      "error",
+      "R1",
+      "upload",
+      "paired-end"
+    ],
+    "text": "The error \"Missing R1 file\" or similar occurs when the pipeline cannot find the first read file for a paired-end sample. Check that you selected an R1 FASTQ file and that the upload completed successfully. Also ensure that the input field labeled R1 indeed contains the first read (forward) file and that it has a valid FASTQ extension.",
+    "category": "support"
+  },
+  {
+    "id": "error_missing_r2",
+    "title": "Error: Missing R2 file",
+    "tags": [
+      "support",
+      "error",
+      "R2",
+      "upload",
+      "paired-end"
+    ],
+    "text": "The error \"Missing R2 file\" occurs when the pipeline cannot find the second read file for a paired-end sample. Check that you uploaded both R1 and R2, and that the R2 filename matches the sample naming pattern used for R1 (for example, sample_R1.fastq.gz and sample_R2.fastq.gz). Also verify that the R2 file is not corrupted and that its upload reached 100% before you submitted the job.",
+    "category": "support"
+  },
+  {
+    "id": "error_pipeline_failed",
+    "title": "Job failed: how to triage common issues",
+    "tags": [
+      "support",
+      "error",
+      "failed",
+      "snakemake rc=1",
+      "debug"
+    ],
+    "text": "If your job status is \"failed\", open the job logs or snakemake.log. Common causes include: (1) incomplete uploads or corrupted FASTQ files; (2) insufficient disk space or temporary storage errors; (3) extremely low coverage or unusual read structure, preventing assembly; or (4) third-party tools exiting with an error due to incompatible input. Look for the first \"Error\" message or a non-zero exit code (rc≠0) in the log. If you cannot identify the cause, contact the maintainers with the job ID and a copy of the relevant log lines.",
+    "category": "support"
+  },
+  {
+    "id": "getting_help",
+    "title": "Getting help and reporting issues",
+    "tags": [
+      "help",
+      "support",
+      "contact",
+      "bug report"
+    ],
+    "text": "If you encounter problems while using GENOCULAR, you can use the built-in assistant to ask about common issues, check the job logs for specific errors, and review the documentation for each pipeline step. When contacting the maintainers, include your job ID, sample name, and a brief description of the issue, along with relevant log snippets. This information helps diagnose whether the problem is due to input data, resource limits, or an internal pipeline bug.",
+    "category": "support"
+  }
+]

@@ -1,0 +1,1924 @@
+#!/usr/bin/env python
+from snakemake.io import glob_wildcards
+import os
+import glob
+import re
+from pathlib import Path
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+############################################
+# HADEG SETTINGS
+############################################
+BASE_PATH = config.get("BASE", os.environ.get("BASE_PATH", "/data/genoverse"))
+OUTPUT_ROOT = f"{BASE_PATH}/MAG_shortread_results"
+
+HADEG_DB     = os.environ.get("HADEG_DB", "/dbs/hadeg/HADEG_protein_database_231119.faa")
+HADEG_OUTDIR = f"{OUTPUT_ROOT}/hadeg"
+HADEG_RUNNER = os.environ.get(
+    "HADEG_RUNNER",
+    "/project/workflow/UPDATE_2026/META/run_hadeg_proteinortho.py",
+)
+HADEG_STALL_SECONDS = int(os.environ.get("HADEG_STALL_SECONDS", "900"))
+HADEG_MAX_ATTEMPTS = int(os.environ.get("HADEG_MAX_ATTEMPTS", "3"))
+
+############################################
+# CONFIG
+############################################
+SAMPLE  = config["sample"]
+THREADS = config.get("threads", 64)  
+config.setdefault("reads", {})
+config["reads"].setdefault("r1", config.get("R1"))
+config["reads"].setdefault("r2", config.get("R2"))
+config.setdefault("kneaddata_db", os.environ.get("KNEADDATA_DB", "/dbs/kneaddata_db"))
+
+FASTP_CONFIG = config.get("fastp", {})
+FASTP_QUALIFIED_Q = int(FASTP_CONFIG.get("qualified_quality_phred", 20))
+FASTP_MIN_LENGTH = int(FASTP_CONFIG.get("minimum_length", 50))
+FASTP_LOW_COMPLEXITY = as_bool(FASTP_CONFIG.get("low_complexity_filter", True))
+FASTP_CUT_FRONT = as_bool(FASTP_CONFIG.get("cut_front", True))
+FASTP_CUT_TAIL = as_bool(FASTP_CONFIG.get("cut_tail", True))
+FASTP_LOW_COMPLEXITY_FLAG = "--low_complexity_filter" if FASTP_LOW_COMPLEXITY else ""
+FASTP_CUT_FRONT_FLAG = "--cut_front" if FASTP_CUT_FRONT else ""
+FASTP_CUT_TAIL_FLAG = "--cut_tail" if FASTP_CUT_TAIL else ""
+
+MEGAHIT_CONFIG = config.get("megahit", {})
+MEGAHIT_MIN_CONTIG_LEN = int(MEGAHIT_CONFIG.get("min_contig_len", 1000))
+
+KRAKEN_CONFIG = config.get("kraken2", {})
+RUN_KRAKEN = as_bool(KRAKEN_CONFIG.get("enabled", True))
+KRAKEN_CONFIDENCE = float(KRAKEN_CONFIG.get("confidence", 0.0))
+KRAKEN_MIN_HIT_GROUPS = int(KRAKEN_CONFIG.get("minimum_hit_groups", 2))
+KRAKEN_CONFIDENCE_FLAG = f"--confidence {KRAKEN_CONFIDENCE}" if KRAKEN_CONFIDENCE > 0 else ""
+KRAKEN_MIN_HIT_GROUPS_FLAG = (
+    f"--minimum-hit-groups {KRAKEN_MIN_HIT_GROUPS}"
+    if KRAKEN_MIN_HIT_GROUPS > 0 else ""
+)
+
+BRACKEN_CONFIG = config.get("bracken", {})
+BRACKEN_LEVEL = str(BRACKEN_CONFIG.get("level", "S"))
+BRACKEN_THRESHOLD = int(BRACKEN_CONFIG.get("threshold", 10))
+BRACKEN_READ_LENGTH = int(BRACKEN_CONFIG.get("read_length", 150))
+
+VIRAL_CONFIG = config.get("viral", {})
+RUN_VIRSORTER2 = as_bool(VIRAL_CONFIG.get("enabled", True))
+VIRSORTER_MIN_LENGTH = int(VIRAL_CONFIG.get("virsorter2_min_length", 1500))
+VIRSORTER_MIN_SCORE = float(VIRAL_CONFIG.get("virsorter2_min_score", 0.5))
+
+SEMIBIN_CONFIG = config.get("semibin", {})
+SEMIBIN_MIN_LEN = int(SEMIBIN_CONFIG.get("min_len", 1500))
+
+GUNC_CONFIG = config.get("gunc", {})
+RUN_GUNC = as_bool(GUNC_CONFIG.get("enabled", True))
+GUNC_MIN_MAPPED_GENES = int(GUNC_CONFIG.get("minimum_mapped_genes", 11))
+
+QUALITY_CONFIG = config.get("quality_thresholds", {})
+MIN_COMPLETENESS = float(QUALITY_CONFIG.get("minimum_completeness", 50.0))
+MAX_CONTAMINATION = float(QUALITY_CONFIG.get("maximum_contamination", 10.0))
+
+DREP_CONFIG = config.get("drep_options", {})
+DREP_PRIMARY_ANI = float(DREP_CONFIG.get("primary_ani", 0.90))
+DREP_SECONDARY_ANI = float(DREP_CONFIG.get("secondary_ani", 0.95))
+DREP_ALIGNED_FRACTION = float(DREP_CONFIG.get("minimum_aligned_fraction", 0.30))
+DREP_MIN_COMPLETENESS = float(DREP_CONFIG.get("minimum_completeness", MIN_COMPLETENESS))
+DREP_MAX_CONTAMINATION = float(DREP_CONFIG.get("maximum_contamination", MAX_CONTAMINATION))
+
+ANNOTATION_MODULES = config.get("annotation_modules", {})
+RUN_PROKKA = as_bool(ANNOTATION_MODULES.get("prokka", True))
+RUN_CCTYPER = as_bool(ANNOTATION_MODULES.get("cctyper", True))
+RUN_DBCAN = as_bool(ANNOTATION_MODULES.get("dbcan", True))
+RUN_ABRICATE = as_bool(ANNOTATION_MODULES.get("abricate", True))
+RUN_HADEG = as_bool(ANNOTATION_MODULES.get("hadeg", True))
+RUN_BUSCO_FILTERED = as_bool(ANNOTATION_MODULES.get("busco_filtered", True))
+
+RUN_PROKKA_CHAIN = RUN_PROKKA or RUN_CCTYPER or RUN_DBCAN or RUN_ABRICATE or RUN_HADEG
+
+# Per-MAG thread cap: keeps 4 MAG jobs running simultaneously on 64 cores
+MAG_THREADS = max(1, min(8, THREADS // 4))
+
+wildcard_constraints:
+    sample = r"[^/]+",
+    mag = r"[^/]+"
+
+############################################
+# OUTPUT DIRECTORIES  (unchanged)
+############################################
+RAW_QC_DIR   = f"{OUTPUT_ROOT}/fastqc/raw"
+CLEAN_QC_DIR = f"{OUTPUT_ROOT}/fastqc/clean"
+NONPAREIL_DIR= f"{OUTPUT_ROOT}/nonpareil"
+KRAKEN_DIR   = f"{OUTPUT_ROOT}/kraken"
+VIRAL_DIR    = f"{OUTPUT_ROOT}/viral"
+FASTP_DIR    = f"{OUTPUT_ROOT}/fastp"
+KNEAD_DIR    = f"{OUTPUT_ROOT}/kneaddata"
+META_DIR     = f"{OUTPUT_ROOT}/metaphlan"
+ASSEMBLY_DIR = f"{OUTPUT_ROOT}/assembly"
+MAP_DIR      = f"{OUTPUT_ROOT}/mapping"
+BIN_DIR      = f"{OUTPUT_ROOT}/binning"
+DAS_DIR      = f"{OUTPUT_ROOT}/dastool"
+CHECKM_DIR   = f"{OUTPUT_ROOT}/checkm2"
+BUSCO_DIR    = f"{OUTPUT_ROOT}/busco"
+BUSCO_FILTERED_DIR = f"{OUTPUT_ROOT}/busco_filtered"
+GUNC_DIR     = f"{OUTPUT_ROOT}/gunc"
+MAGQC_DIR    = f"{OUTPUT_ROOT}/mag_quast"
+MERGED_QC    = f"{OUTPUT_ROOT}/mag_merged_qc"
+FILTERED_DIR = f"{OUTPUT_ROOT}/mag_filtered"
+REJECTED_DIR = f"{OUTPUT_ROOT}/mag_rejected"
+GTDB_DIR     = f"{OUTPUT_ROOT}/gtdbtk"
+DREP_DIR     = f"{OUTPUT_ROOT}/drep"
+BARRNAP_DIR  = f"{OUTPUT_ROOT}/barrnap"
+PROKKA_DIR   = f"{OUTPUT_ROOT}/annotation/prokka"
+CCTYPER_DIR  = f"{OUTPUT_ROOT}/annotation/cctyper"
+DBCAN_DIR    = f"{OUTPUT_ROOT}/annotation/dbcan"
+ABRICATE_DIR = f"{OUTPUT_ROOT}/annotation/abricate"
+PRODIGAL_DIR = f"{OUTPUT_ROOT}/prodigal"
+CDHIT_DIR    = f"{OUTPUT_ROOT}/cdhit"
+SALMON_DIR   = f"{OUTPUT_ROOT}/salmon"
+COVERM_DIR   = f"{OUTPUT_ROOT}/coverm"
+MULTIQC_DIR  = f"{OUTPUT_ROOT}/multiqc"
+QUAST_DIR    = f"{OUTPUT_ROOT}/quast"
+
+############################################
+# SERVER TOOL AND DATABASE PATHS
+############################################
+def _find_env(env_var, env_names, probe):
+    candidates = [os.environ.get(env_var, "")]
+    candidates.extend(f"/opt/conda/envs/{name}" for name in env_names)
+    shared = Path(os.environ.get(
+        "SHARED_CONDA_PREFIX",
+        "/data/genoverse/smk_envs_profiles/metagenomics/short/tool_envs",
+    ))
+    candidates.extend(str(shared / name) for name in env_names)
+    if shared.exists():
+        candidates.extend(str(path) for path in sorted(shared.iterdir()) if path.is_dir())
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "bin" / probe).exists():
+            return Path(candidate)
+    return None
+
+def _tool(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin" / binary) if env_dir else binary
+
+def _binpath(env_var, env_names, binary):
+    env_dir = _find_env(env_var, env_names, binary)
+    return str(env_dir / "bin") if env_dir else ""
+
+FASTP         = _tool("GENOVERSE_ENV_MARINE", ["marine"], "fastp")
+KNEADDATA     = _tool("GENOVERSE_ENV_KNEADDATA", ["kneaddata_env", "kneaddata"], "kneaddata")
+METAPHLAN     = _tool("GENOVERSE_ENV_METAPHLAN", ["metaphlan_env", "metaphlan"], "metaphlan")
+BOWTIE2_META  = _tool("GENOVERSE_ENV_METAPHLAN", ["metaphlan_env", "metaphlan"], "bowtie2")
+MEGAHIT       = _tool("GENOVERSE_ENV_MEGAHIT", ["megahit_env", "megahit"], "megahit")
+BOWTIE2       = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2")
+BOWTIE2_BUILD = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "bowtie2-build")
+SAMTOOLS      = _tool("GENOVERSE_ENV_MAPPING", ["mapping_env", "mapping"], "samtools")
+METABAT2      = _tool("GENOVERSE_ENV_BINNING", ["binning"], "metabat2")
+MAXBIN        = _tool("GENOVERSE_ENV_BINNING", ["binning"], "run_MaxBin.pl")
+DASTOOL       = _tool("GENOVERSE_ENV_BINNING", ["binning"], "DAS_Tool")
+JGI           = _tool("GENOVERSE_ENV_BINNING", ["binning"], "jgi_summarize_bam_contig_depths")
+CHECKM2       = _tool("GENOVERSE_ENV_CHECKM2", ["checkm2_env", "checkm2"], "checkm2")
+CHECKM2_PY    = _tool("GENOVERSE_ENV_CHECKM2", ["checkm2_env", "checkm2"], "python")
+BUSCO_BIN     = _tool("GENOVERSE_ENV_BUSCO", ["busco"], "busco")
+GUNC_BIN      = _tool("GENOVERSE_ENV_GUNC", ["gunc_env", "gunc"], "gunc")
+GTDBTK        = _tool("GENOVERSE_ENV_GTDBTK", ["gtdbk_env", "gtdbtk"], "gtdbtk")
+DREP_BIN      = _tool("GENOVERSE_ENV_DREP", ["drep_env", "drep"], "dRep")
+BARRNAP_BIN   = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "barrnap")
+PROKKA        = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "prokka")
+CCTYPER_BIN   = _tool("GENOVERSE_ENV_CCTYPER", ["cctyper"], "cctyper")
+DBCAN_BIN     = _tool("GENOVERSE_ENV_DBCAN", ["dbcan"], "run_dbcan")
+ABRICATE      = _tool("GENOVERSE_ENV_ABRICATE", ["abricate-env", "abricate"], "abricate")
+PRODIGAL      = _tool("GENOVERSE_ENV_MARINE", ["marine"], "prodigal")
+CDHIT         = _tool("GENOVERSE_ENV_CDHIT", ["cdhit-env", "cdhit"], "cd-hit-est")
+SALMON        = _tool("GENOVERSE_ENV_SALMON", ["salmon-env", "salmon"], "salmon")
+COVERM        = _tool("GENOVERSE_ENV_COVERM", ["coverm-env", "coverm"], "coverm")
+MULTIQC       = _tool("GENOVERSE_ENV_MULTIQC", ["multiqc_env", "multiqc"], "multiqc")
+QUAST         = _tool("GENOVERSE_ENV_QUAST", ["quast"], "metaquast.py")
+QUAST_BIN     = _tool("GENOVERSE_ENV_QUAST", ["quast"], "quast.py")
+FASTQC        = _tool("GENOVERSE_ENV_FASTQC", ["fastqc"], "fastqc")
+PIGZ          = _tool("GENOVERSE_ENV_MARINE", ["marine"], "pigz")
+KRAKEN2       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2_env", "kraken2"], "kraken2")
+BRACKEN       = _tool("GENOVERSE_ENV_KRAKEN", ["kraken2_env", "kraken2"], "bracken")
+NONPAREIL     = _tool("GENOVERSE_ENV_NONPAREIL", ["nonpareil"], "nonpareil")
+SEMIBIN2      = _tool("GENOVERSE_ENV_BINNING", ["binning"], "SemiBin2")
+VIRSORTER2    = _tool("GENOVERSE_ENV_VIRSORTER", ["virsorter"], "virsorter")
+TRNASCAN      = _tool("GENOVERSE_ENV_PROKKA", ["prokka"], "tRNAscan-SE")
+PROTEINORTHO  = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "proteinortho")
+HADEG_DIAMOND = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "diamond")
+HADEG_PYTHON  = _tool("GENOVERSE_ENV_HADEG", ["hadeg"], "python")
+
+METAPHLAN_DB  = os.environ.get("METAPHLAN_DB", "/dbs/metaphlan_db")
+
+def _resolve_kraken2_db(path):
+    if os.path.exists(os.path.join(path, "taxo.k2d")):
+        return path
+    matches = sorted(glob.glob(os.path.join(path, "*", "taxo.k2d")))
+    if matches:
+        return os.path.dirname(matches[0])
+    return path
+
+KRAKEN2_DB    = _resolve_kraken2_db(os.environ.get("KRAKEN2_DB", "/dbs/kraken2_db"))
+VIRSORTER2_DB = os.environ.get("VIRSORTER2_DB", "/dbs/virsorter2_db")
+GUNC_DB       = os.environ.get("GUNC_DB", "/dbs/gunc_db")
+CHECKM2_DB    = os.environ.get("CHECKM2_DB", "/dbs/checkm2/CheckM2_database/uniref100.KO.1.dmnd")
+GTDBTK_DB     = os.environ.get("GTDBTK_DATA_PATH", "/dbs/gtdbtk")
+BUSCO_LINEAGE = os.environ.get("BUSCO_LINEAGE", "/dbs/busco_bacteria_odb12")
+CCTYPER_DB    = os.environ.get("CCTYPER_DB", "/dbs/cctyper")
+DBCAN_DB      = os.environ.get("DBCAN_DB_DIR", "/dbs/dbcan_db/db")
+
+KNEADDATA_ENV = str(Path(KNEADDATA).parent)
+METAPHLAN_ENV = str(Path(METAPHLAN).parent)
+BINNING_ENV   = str(Path(METABAT2).parent)
+MAPPING_ENV   = str(Path(BOWTIE2).parent)
+FASTQC_ENV    = str(Path(FASTQC).parent)
+KRAKEN_ENV    = str(Path(KRAKEN2).parent)
+NONPAREIL_ENV = str(Path(NONPAREIL).parent)
+VIRSORTER2_ENV= str(Path(VIRSORTER2).parent)
+GUNC_ENV      = str(Path(GUNC_BIN).parent)
+PROKKA_ENV    = str(Path(PROKKA).parent)
+GTDBTK_ENV    = str(Path(GTDBTK).parent)
+DREP_ENV      = str(Path(DREP_BIN).parent)
+COVERM_ENV    = str(Path(COVERM).parent)
+CCTYPER_ENV   = str(Path(CCTYPER_BIN).parent)
+DBCAN_ENV     = str(Path(DBCAN_BIN).parent)
+ABRICATE_ENV  = str(Path(ABRICATE).parent)
+BARRNAP_ENV   = str(Path(BARRNAP_BIN).parent)
+CHECKM2_ENV   = str(Path(CHECKM2).parent)
+BUSCO_ENV     = str(Path(BUSCO_BIN).parent)
+QUAST_ENV     = str(Path(QUAST_BIN).parent)
+
+############################################
+# ABRicate databases
+############################################
+ABRICATE_DBS = [
+    "ncbi", "argannot", "resfinder", "ecoli_vf",
+    "vfdb", "ecoh", "plasmidfinder", "card"
+]
+
+############################################
+# HELPER: resolve MAGs after checkpoint
+############################################
+def get_mags(wildcards):
+    ckpt = checkpoints.select_dastool_bins.get(sample=wildcards.sample)
+    bins_dir = ckpt.output.bins
+    return glob_wildcards(os.path.join(bins_dir, "{mag}.fa")).mag
+
+def get_filtered_mags(wildcards):
+    ckpt = checkpoints.mag_filter.get(sample=wildcards.sample)
+    filt_dir = ckpt.output.filtered
+    return glob_wildcards(os.path.join(filt_dir, "{mag}.fa")).mag
+
+FINAL_TARGETS = [
+    f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+    f"{NONPAREIL_DIR}/{SAMPLE}.npo",
+    f"{FASTP_DIR}/{SAMPLE}_fastp.json",
+    f"{FASTP_DIR}/{SAMPLE}_fastp.html",
+    f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+    f"{META_DIR}/{SAMPLE}_profile.txt",
+    f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa",
+    f"{QUAST_DIR}/{SAMPLE}/report.html",
+    f"{BIN_DIR}/{SAMPLE}/semibin2.done",
+    f"{MAP_DIR}/{SAMPLE}_depth.txt",
+    f"{BIN_DIR}/{SAMPLE}/metabat2.done",
+    f"{DAS_DIR}/{SAMPLE}_DASTool_bins_clean.done",
+    f"{CHECKM_DIR}/{SAMPLE}/quality_report.tsv",
+    f"{BUSCO_DIR}/{SAMPLE}/busco.done",
+    f"{MAGQC_DIR}/{SAMPLE}/mag_quast.done",
+    f"{MERGED_QC}/{SAMPLE}/combined_quality_summary.tsv",
+    f"{FILTERED_DIR}/{SAMPLE}.filter.done",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.bac120.summary.tsv",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.ar53.summary.tsv",
+    f"{DREP_DIR}/{SAMPLE}/dereplicated_genomes",
+    f"{BARRNAP_DIR}/{SAMPLE}/barrnap.done",
+    f"{BARRNAP_DIR}/{SAMPLE}/all_MAGs_16S_rRNA.fa",
+    f"{BARRNAP_DIR}/{SAMPLE}/16S_detection_summary.tsv",
+    f"{COVERM_DIR}/{SAMPLE}/coverage.tsv",
+    f"{PRODIGAL_DIR}/{SAMPLE}/predicted_genes.ffn",
+    f"{CDHIT_DIR}/{SAMPLE}/gene_catalogue_nr.ffn",
+    f"{SALMON_DIR}/{SAMPLE}/index",
+    f"{SALMON_DIR}/{SAMPLE}/quant/quant.sf",
+    f"{MULTIQC_DIR}/multiqc_report.html",
+]
+if RUN_KRAKEN:
+    FINAL_TARGETS.append(f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv")
+if RUN_VIRSORTER2:
+    FINAL_TARGETS.append(f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done")
+if RUN_GUNC:
+    FINAL_TARGETS.append(f"{GUNC_DIR}/{SAMPLE}/gunc_maxcss.tsv")
+if RUN_PROKKA_CHAIN:
+    FINAL_TARGETS.append(f"{PROKKA_DIR}/{SAMPLE}/prokka.done")
+if RUN_CCTYPER:
+    FINAL_TARGETS.append(f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done")
+if RUN_DBCAN:
+    FINAL_TARGETS.append(f"{DBCAN_DIR}/{SAMPLE}/dbcan.done")
+if RUN_ABRICATE:
+    FINAL_TARGETS.append(f"{ABRICATE_DIR}/{SAMPLE}/abricate.done")
+if RUN_HADEG:
+    FINAL_TARGETS.append(f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done")
+if RUN_BUSCO_FILTERED:
+    FINAL_TARGETS.append(f"{BUSCO_FILTERED_DIR}/{SAMPLE}/busco_filtered_all.done")
+
+MULTIQC_INPUTS = [
+    f"{FASTP_DIR}/{SAMPLE}_fastp.json",
+    f"{QUAST_DIR}/{SAMPLE}/report.html",
+    f"{MAP_DIR}/{SAMPLE}.sorted.bam",
+    f"{CHECKM_DIR}/{SAMPLE}/quality_report.tsv",
+    f"{BUSCO_DIR}/{SAMPLE}/busco.done",
+    f"{MERGED_QC}/{SAMPLE}/combined_quality_summary.tsv",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.bac120.summary.tsv",
+    f"{GTDB_DIR}/{SAMPLE}/gtdbtk.ar53.summary.tsv",
+    f"{DREP_DIR}/{SAMPLE}/dereplicated_genomes",
+    f"{COVERM_DIR}/{SAMPLE}/coverage.tsv",
+    f"{BARRNAP_DIR}/{SAMPLE}/16S_detection_summary.tsv",
+    f"{BARRNAP_DIR}/{SAMPLE}/barrnap.done",
+    f"{SALMON_DIR}/{SAMPLE}/quant/quant.sf",
+]
+if RUN_PROKKA_CHAIN:
+    MULTIQC_INPUTS.append(f"{PROKKA_DIR}/{SAMPLE}/prokka.done")
+if RUN_CCTYPER:
+    MULTIQC_INPUTS.append(f"{CCTYPER_DIR}/{SAMPLE}/cctyper.done")
+if RUN_DBCAN:
+    MULTIQC_INPUTS.append(f"{DBCAN_DIR}/{SAMPLE}/dbcan.done")
+if RUN_ABRICATE:
+    MULTIQC_INPUTS.append(f"{ABRICATE_DIR}/{SAMPLE}/abricate.done")
+if RUN_HADEG:
+    MULTIQC_INPUTS.append(f"{HADEG_OUTDIR}/{SAMPLE}/hadeg_proteinortho.done")
+if RUN_BUSCO_FILTERED:
+    MULTIQC_INPUTS.append(f"{BUSCO_FILTERED_DIR}/{SAMPLE}/busco_filtered_all.done")
+if RUN_KRAKEN:
+    MULTIQC_INPUTS.append(f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv")
+if RUN_VIRSORTER2:
+    MULTIQC_INPUTS.append(f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done")
+if RUN_GUNC:
+    MULTIQC_INPUTS.append(f"{GUNC_DIR}/{SAMPLE}/gunc_maxcss.tsv")
+
+
+# =============================================================================
+# RULE ALL — FINAL TARGETS
+# Parallelism is implicit: Snakemake resolves the DAG and schedules all
+# independent branches simultaneously when --cores / --jobs allow it.
+# =============================================================================
+ANALYSIS_TYPE = "metagenomics"
+ANALYSIS_MODE = "short"
+ANALYSIS_ROOT_PATTERN = BASE_PATH
+ANALYSIS_SAMPLE = SAMPLE
+ANALYSIS_PREREQUISITES = list(FINAL_TARGETS)
+FINAL_TARGETS.append(f"{BASE_PATH}/analysis/index.json")
+
+rule all:
+    input: FINAL_TARGETS
+
+include: "/project/workflow/UPDATE_2026/analysis_bundle.smk"
+
+
+# =============================================================================
+# PHASE 1 — PREPROCESSING  (sequential: fastp → kneaddata)
+# =============================================================================
+
+rule fastp:
+    input:
+        r1 = config["reads"]["r1"],
+        r2 = config["reads"]["r2"]
+    output:
+        r1   = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq",
+        r2   = f"{FASTP_DIR}/{SAMPLE}_2.clean.fastq",
+        json = f"{FASTP_DIR}/{SAMPLE}_fastp.json",
+        html = f"{FASTP_DIR}/{SAMPLE}_fastp.html"
+    threads: THREADS
+    shell:
+        """
+        mkdir -p {FASTP_DIR}
+        {FASTP} \
+          -i {input.r1} -I {input.r2} \
+          -o {output.r1} -O {output.r2} \
+          -j {output.json} -h {output.html} \
+          --qualified_quality_phred {FASTP_QUALIFIED_Q} \
+          --length_required {FASTP_MIN_LENGTH} \
+          {FASTP_LOW_COMPLEXITY_FLAG} \
+          {FASTP_CUT_FRONT_FLAG} \
+          {FASTP_CUT_TAIL_FLAG} \
+          -w {threads}
+        """
+
+rule kneaddata:
+    input:
+        r1 = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq",
+        r2 = f"{FASTP_DIR}/{SAMPLE}_2.clean.fastq"
+    output:
+        r1 = f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+        r2 = f"{KNEAD_DIR}/{SAMPLE}_paired_2.fastq"
+    threads: THREADS
+    shell:
+        """
+        export PATH={KNEADDATA_ENV}:$PATH
+        mkdir -p {KNEAD_DIR}
+        kneaddata \
+          --input1 {input.r1} \
+          --input2 {input.r2} \
+          --output {KNEAD_DIR} \
+          --reference-db {config[kneaddata_db]} \
+          --threads {threads} \
+          --bypass-trim \
+          --bypass-trf \
+          --output-prefix {SAMPLE}
+        """
+
+
+# =============================================================================
+# PHASE 2 — COMMUNITY PROFILING
+# PARALLEL with Phase 3: both start as soon as kneaddata finishes.
+# =============================================================================
+
+rule metaphlan:
+    input:
+        r1 = f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+        r2 = f"{KNEAD_DIR}/{SAMPLE}_paired_2.fastq"
+    output:
+        profile = f"{META_DIR}/{SAMPLE}_profile.txt",
+        bowtie2 = f"{META_DIR}/{SAMPLE}.bowtie2.bz2"
+    # PARALLEL OPTIMISATION: MetaPhlAn gets half the cores so MEGAHIT can
+    # start simultaneously on the other half.  Adjust the split to suit
+    # your server (e.g. 16+16 on a 32-core machine).
+    threads: max(1, THREADS // 2)
+    shell:
+        """
+        mkdir -p {META_DIR}
+        export PATH={METAPHLAN_ENV}:$PATH
+        {METAPHLAN} {input.r1},{input.r2} \
+          --input_type fastq \
+          --bowtie2db {METAPHLAN_DB} \
+          -x mpa_vJan25_CHOCOPhlAnSGB_202503 \
+          --bowtie2_exe {BOWTIE2_META} \
+          --bowtie2out {output.bowtie2} \
+          --nproc {threads} \
+          -o {output.profile}
+        """
+
+
+# =============================================================================
+# PHASE 3 — ASSEMBLY AND ASSEMBLY QC
+# PARALLEL with Phase 2: starts as soon as kneaddata finishes.
+# =============================================================================
+
+rule megahit:
+    input:
+        r1 = f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+        r2 = f"{KNEAD_DIR}/{SAMPLE}_paired_2.fastq"
+    output:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa"
+    # PARALLEL OPTIMISATION: MEGAHIT gets the other half of cores while
+    # MetaPhlAn runs simultaneously.
+    threads: max(1, THREADS // 2)
+    shell:
+        """
+        mkdir -p {ASSEMBLY_DIR}
+        WORKDIR={ASSEMBLY_DIR}/megahit_{SAMPLE}
+        rm -rf $WORKDIR
+        {MEGAHIT} \
+          -1 {input.r1} -2 {input.r2} \
+          -o $WORKDIR \
+          -t {threads} \
+          --min-contig-len {MEGAHIT_MIN_CONTIG_LEN} \
+          --k-list 21,29,39,59,79,99,119,141 \
+          --memory 0.8
+        cp $WORKDIR/final.contigs.fa {output.contigs}
+        """
+
+rule quast:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa",
+        r1      = f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+        r2      = f"{KNEAD_DIR}/{SAMPLE}_paired_2.fastq"
+    output:
+        html = f"{QUAST_DIR}/{SAMPLE}/report.html"
+    threads: THREADS
+    shell:
+        """
+        mkdir -p {QUAST_DIR}/{SAMPLE}
+        {QUAST} {input.contigs} \
+          --pe1 {input.r1} --pe2 {input.r2} \
+          -o {QUAST_DIR}/{SAMPLE} \
+          -t {threads}
+        """
+
+
+# =============================================================================
+# PHASE 4 — READ MAPPING AND BINNING  (sequential within phase)
+# Starts as soon as MEGAHIT finishes; MetaPhlAn may still be running — OK.
+# =============================================================================
+
+rule bowtie2_index:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa"
+    output:
+        f"{MAP_DIR}/{SAMPLE}_index.1.bt2",
+        f"{MAP_DIR}/{SAMPLE}_index.2.bt2",
+        f"{MAP_DIR}/{SAMPLE}_index.3.bt2",
+        f"{MAP_DIR}/{SAMPLE}_index.4.bt2",
+        f"{MAP_DIR}/{SAMPLE}_index.rev.1.bt2",
+        f"{MAP_DIR}/{SAMPLE}_index.rev.2.bt2"
+    threads: THREADS
+    shell:
+        """
+        mkdir -p {MAP_DIR}
+        {BOWTIE2_BUILD} --threads {threads} {input.contigs} {MAP_DIR}/{SAMPLE}_index
+        """
+
+rule bowtie2_map:
+    input:
+        r1  = f"{KNEAD_DIR}/{SAMPLE}_paired_1.fastq",
+        r2  = f"{KNEAD_DIR}/{SAMPLE}_paired_2.fastq",
+        idx = f"{MAP_DIR}/{SAMPLE}_index.1.bt2"
+    output:
+        bam = f"{MAP_DIR}/{SAMPLE}.sorted.bam",
+        bai = f"{MAP_DIR}/{SAMPLE}.sorted.bam.bai"
+    threads: THREADS
+    shell:
+        """
+        {BOWTIE2} \
+          -x {MAP_DIR}/{SAMPLE}_index \
+          -1 {input.r1} -2 {input.r2} \
+          -p {threads} \
+          --no-unal \
+        | {SAMTOOLS} sort -@ {threads} -o {output.bam}
+        {SAMTOOLS} index {output.bam}
+        """
+
+rule depth:
+    input:
+        bam   = f"{MAP_DIR}/{SAMPLE}.sorted.bam",
+        bai   = f"{MAP_DIR}/{SAMPLE}.sorted.bam.bai"
+    output:
+        depth = f"{MAP_DIR}/{SAMPLE}_depth.txt"
+    threads: THREADS
+    shell:
+        """
+        export PATH={BINNING_ENV}:{MAPPING_ENV}:$PATH
+        {JGI} --outputDepth {output.depth} {input.bam}
+        """
+
+# PARALLEL OPTIMISATION: metabat2 and maxbin2 both depend on (contigs, depth)
+# and are independent of each other → Snakemake runs them simultaneously.
+rule metabat2:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa",
+        depth   = f"{MAP_DIR}/{SAMPLE}_depth.txt"
+    output:
+        bins = directory(f"{BIN_DIR}/{SAMPLE}/metabat2"),
+        done = f"{BIN_DIR}/{SAMPLE}/metabat2.done"
+    threads: THREADS
+    shell:
+        """
+        mkdir -p {output.bins}
+        export PATH={BINNING_ENV}:$PATH
+        {METABAT2} \
+          -i {input.contigs} \
+          -a {input.depth} \
+          -o {output.bins}/{SAMPLE}_bin \
+          -t {threads}
+        touch {output.done}
+        """
+
+rule maxbin2:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa",
+        depth   = f"{MAP_DIR}/{SAMPLE}_depth.txt"
+    output:
+        directory(f"{BIN_DIR}/{SAMPLE}/maxbin2")
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        export PATH={BINNING_ENV}:$PATH
+        export PERL5LIB="$(dirname {BINNING_ENV})/lib/perl5${{PERL5LIB:+:$PERL5LIB}}"
+        mkdir -p {output}
+
+        awk 'NR>1 {{print $1"\t"$3}}' {input.depth} \
+            > {output}/{SAMPLE}_maxbin_abund.txt
+
+        perl {MAXBIN} \
+          -contig {input.contigs} \
+          -abund  {output}/{SAMPLE}_maxbin_abund.txt \
+          -out    {output}/{SAMPLE} \
+          -thread {threads}
+        """
+
+rule contig2bin_tables:
+    input:
+        metabat = f"{BIN_DIR}/{SAMPLE}/metabat2",
+        maxbin  = f"{BIN_DIR}/{SAMPLE}/maxbin2"
+    output:
+        metabat_tsv = f"{BIN_DIR}/{SAMPLE}/metabat2_contig2bin.tsv",
+        maxbin_tsv  = f"{BIN_DIR}/{SAMPLE}/maxbin2_contig2bin.tsv"
+    shell:
+        r"""
+        > {output.metabat_tsv}
+        for f in {input.metabat}/*.fa; do
+          [ -f "$f" ] || continue
+          bin=$(basename "$f" .fa)
+          awk '/^>/{{split($1,a,">");print a[2]"\t"bin}}' bin="$bin" "$f" \
+            >> {output.metabat_tsv}
+        done
+
+        > {output.maxbin_tsv}
+        for f in {input.maxbin}/*.fasta; do
+          [ -f "$f" ] || continue
+          bin=$(basename "$f" .fasta)
+          awk '/^>/{{split($1,a,">");print a[2]"\t"bin}}' bin="$bin" "$f" \
+            >> {output.maxbin_tsv}
+        done
+        """
+
+rule dastool:
+    input:
+        metabat = f"{BIN_DIR}/{SAMPLE}/metabat2_contig2bin.tsv",
+        maxbin  = f"{BIN_DIR}/{SAMPLE}/maxbin2_contig2bin.tsv",
+        semibin = f"{BIN_DIR}/{SAMPLE}/semibin2_contig2bin.tsv",
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa"
+    output:
+        bins = directory(f"{DAS_DIR}/{SAMPLE}_DASTool_bins"),
+        done = f"{DAS_DIR}/{SAMPLE}.dastool.done"
+    threads: THREADS
+    shell:
+        """
+        export PATH={BINNING_ENV}:$PATH
+        mkdir -p {DAS_DIR}
+        {DASTOOL} \
+          -i {input.metabat},{input.maxbin},{input.semibin} \
+          -l metabat2,maxbin2,semibin2 \
+          -c {input.contigs} \
+          -o {DAS_DIR}/{SAMPLE} \
+          -t {threads} \
+          --write_bins
+        mkdir -p {output.bins}
+        touch {output.done}
+        """
+
+checkpoint select_dastool_bins:
+    input:
+        bins_dir = f"{DAS_DIR}/{{sample}}_DASTool_bins",
+        done     = f"{DAS_DIR}/{{sample}}.dastool.done"
+    output:
+        bins = directory(f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"),
+        done = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean.done"
+    shell:
+        """
+        mkdir -p {output.bins}
+        for f in {input.bins_dir}/*.fa; do
+          [ -f "$f" ] || continue
+          fname=$(basename "$f" .fa)
+          case "$fname" in
+            *_sub) continue ;;
+          esac
+          cp "$f" {output.bins}/
+        done
+        if [ -z "$(ls -A {output.bins})" ]; then
+          echo "[select_dastool_bins] No valid MAG bins; continuing with empty MAG reports." >&2
+        fi
+        touch {output.done}
+        """
+
+
+# =============================================================================
+# PHASE 5 — MAG QUALITY ASSESSMENT
+# PARALLEL OPTIMISATION: checkm2, busco, and quast_per_mag all start
+# simultaneously as soon as select_dastool_bins checkpoint resolves.
+# merge_mag_qc waits for all three → triggers mag_filter.
+# =============================================================================
+
+# ── 5a: CheckM2 ──────────────────────────────────────────────────────────────
+rule checkm2:
+    input:
+        bins = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        report = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv"
+    threads: THREADS
+    params:
+        diamond_db = CHECKM2_DB
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {CHECKM_DIR}/{wildcards.sample}
+        bin_count=$(find {input.bins} -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        bin_count="${{bin_count:-0}}"
+        if [ "$bin_count" -eq 0 ]; then
+          printf "Name\tCompleteness\tContamination\n" > {output.report}
+          echo "[checkm2] No final bins — writing an empty quality report." >&2
+          exit 0
+        fi
+        export PATH={CHECKM2_ENV}:{PROKKA_ENV}:$PATH
+        {CHECKM2} predict \
+          --input {input.bins} \
+          --output-directory {CHECKM_DIR}/{wildcards.sample} \
+          --threads {threads} \
+          -x fa \
+          --force \
+          --database_path {params.diamond_db}
+        """
+
+# ── 5b: BUSCO on raw DAS_Tool bins (pre-filter QC only) ──────────────────────
+# NOTE: A second BUSCO run on *filtered* MAGs is performed in Phase 6A
+#       (rules busco_filtered_per_mag / busco_filtered_all).  This rule
+#       provides completeness evidence used by merge_mag_qc → mag_filter.
+# PARALLEL OPTIMISATION: replaced the sequential for-loop with GNU parallel
+# so all MAGs are assessed simultaneously.  Requires `parallel` in PATH
+# (typically: conda install -n busco -c conda-forge parallel).
+rule busco:
+    input:
+        bins = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        done = f"{BUSCO_DIR}/{{sample}}/busco.done"
+    threads: THREADS
+    params:
+        parallel_jobs = max(1, THREADS // 4),
+        lineage = BUSCO_LINEAGE
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {BUSCO_DIR}/{wildcards.sample}
+        export PATH={BUSCO_ENV}:$PATH
+
+        OUTDIR="{BUSCO_DIR}/{wildcards.sample}"
+        LINEAGE="{params.lineage}"
+        MAX_JOBS={params.parallel_jobs}
+        FAIL_FILE="$OUTDIR/.busco_failed"
+        rm -f "$FAIL_FILE"
+        active=0
+
+        for fa in {input.bins}/*.fa; do
+            [ -f "$fa" ] || continue
+            mag=$(basename "$fa" .fa)
+            echo "[BUSCO] Launching $mag"
+            (
+                {BUSCO_BIN} \
+                  -i "$fa" \
+                  -o "$mag" \
+                  --out_path "$OUTDIR" \
+                  -m genome \
+                  -l "$LINEAGE" \
+                  --offline \
+                  -c 4 \
+                  --force 2>&1 || {{ echo "[BUSCO] ERROR: $mag failed" >&2; touch "$FAIL_FILE"; }}
+            ) &
+            active=$(( active + 1 ))
+            if [ "$active" -ge "$MAX_JOBS" ]; then
+                wait
+                active=0
+            fi
+        done
+        wait
+
+        if [ -f "$FAIL_FILE" ]; then
+            rm -f "$FAIL_FILE"
+            echo "[BUSCO] One or more MAG analyses failed." >&2
+            exit 1
+        fi
+
+        touch {output.done}
+        """
+
+
+# ── 5c: QUAST per MAG (scatter — runs per-MAG in parallel) ───────────────────
+rule quast_per_mag:
+    input:
+        fasta = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean/{{mag}}.fa"
+    output:
+        tsv   = f"{MAGQC_DIR}/{{sample}}/{{mag}}/report.tsv"
+    threads: 1   # tiny job; parallelism comes from many instances running at once
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {MAGQC_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={QUAST_ENV}:$PATH
+        {QUAST_BIN} {input.fasta} \
+          -o {MAGQC_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --no-html --no-plots
+        """
+
+rule quast_per_mag_all:
+    input:
+        lambda wildcards: expand(
+            f"{MAGQC_DIR}/{{sample}}/{{mag}}/report.tsv",
+            sample=wildcards.sample,
+            mag=get_mags(wildcards)
+        )
+    output:
+        done = f"{MAGQC_DIR}/{{sample}}/mag_quast.done"
+    shell:
+        "touch {output.done}"
+
+# ── 5d: Merge all QC results ──────────────────────────────────────────────────
+rule merge_mag_qc:
+    input:
+        checkm2 = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv",
+        busco   = f"{BUSCO_DIR}/{{sample}}/busco.done",
+        mag_qc  = f"{MAGQC_DIR}/{{sample}}/mag_quast.done",
+    output:
+        summary = f"{MERGED_QC}/{{sample}}/combined_quality_summary.tsv"
+    params:
+        busco_dir = f"{BUSCO_DIR}/{{sample}}",
+        magqc_dir = f"{MAGQC_DIR}/{{sample}}",
+    run:
+        import pandas as pd
+        import os, re, glob as _glob
+
+        ckm = pd.read_csv(input.checkm2, sep="\t")
+        ckm = ckm.rename(columns={
+            "Name": "MAG",
+            "Completeness": "checkm2_completeness",
+            "Contamination": "checkm2_contamination"
+        })[["MAG", "checkm2_completeness", "checkm2_contamination"]]
+
+        busco_by_mag = {}
+        for summary_file in _glob.glob(
+            os.path.join(params.busco_dir, "**", "short_summary*.txt"),
+            recursive=True
+        ):
+            relative = os.path.relpath(summary_file, params.busco_dir)
+            mag = relative.split(os.sep, 1)[0]
+            with open(summary_file) as fh:
+                content = fh.read()
+            c_pct = s_pct = d_pct = None
+            compact = re.search(
+                r"C:([\d.]+)%\[S:([\d.]+)%,D:([\d.]+)%\]",
+                content,
+            )
+            if compact:
+                c_pct, s_pct, d_pct = map(float, compact.groups())
+            busco_by_mag[mag] = {
+                "MAG": mag,
+                "busco_complete":   c_pct,
+                "busco_single":     s_pct,
+                "busco_duplicated": d_pct
+            }
+        busco_rows = list(busco_by_mag.values())
+        bus = pd.DataFrame(busco_rows) if busco_rows else pd.DataFrame(
+            columns=["MAG", "busco_complete", "busco_single", "busco_duplicated"])
+
+        qst_rows = []
+        for tsv in _glob.glob(os.path.join(params.magqc_dir, "*/report.tsv")):
+            mag = os.path.basename(os.path.dirname(tsv))
+            df  = pd.read_csv(tsv, sep="\t", header=None, names=["metric", "value"])
+            row = {"MAG": mag}
+            for _, r in df.iterrows():
+                if "N50" in r["metric"]:
+                    row["quast_N50"] = r["value"]
+                elif "Total length" in r["metric"] and ">" not in r["metric"]:
+                    row["quast_total_length"] = r["value"]
+                elif "# contigs" in r["metric"] and ">" not in r["metric"]:
+                    row["quast_num_contigs"] = r["value"]
+                elif "GC (%)" in r["metric"]:
+                    row["quast_GC_pct"] = r["value"]
+            qst_rows.append(row)
+        qst = pd.DataFrame(qst_rows) if qst_rows else pd.DataFrame(
+            columns=["MAG", "quast_N50", "quast_total_length",
+                     "quast_num_contigs", "quast_GC_pct"])
+
+        merged = ckm.merge(bus, on="MAG", how="left") \
+                    .merge(qst, on="MAG", how="left") \
+
+        def mimag_tier(row):
+            c_raw = row.get("checkm2_completeness")
+            ct_raw = row.get("checkm2_contamination")
+            c = float(c_raw) if pd.notna(c_raw) else 0.0
+            ct = float(ct_raw) if pd.notna(ct_raw) else 100.0
+            if c >= 90 and ct < 5:
+                return "High Quality"
+            elif c >= 50 and ct < 10:
+                return "Medium Quality"
+            else:
+                return "Low Quality"
+
+        merged["MIMAG_tier"] = merged.apply(mimag_tier, axis=1)
+        os.makedirs(os.path.dirname(output.summary), exist_ok=True)
+        merged.to_csv(output.summary, sep="\t", index=False)
+        print(f"[merge_mag_qc] Written {len(merged)} MAGs → {output.summary}")
+
+checkpoint mag_filter:
+    input:
+        summary  = f"{MERGED_QC}/{{sample}}/combined_quality_summary.tsv",
+        bins_dir = f"{DAS_DIR}/{{sample}}_DASTool_bins_clean"
+    output:
+        filtered = directory(f"{FILTERED_DIR}/{{sample}}"),
+        rejected = directory(f"{REJECTED_DIR}/{{sample}}"),
+        done     = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    run:
+        import pandas as pd, shutil, os
+
+        os.makedirs(output.filtered, exist_ok=True)
+        os.makedirs(output.rejected, exist_ok=True)
+
+        df = pd.read_csv(input.summary, sep="\t")
+        log_lines = ["MAG\tAction\tReason"]
+
+        for _, row in df.iterrows():
+            mag = row["MAG"]
+            src = os.path.join(input.bins_dir, f"{mag}.fa")
+            if not os.path.exists(src):
+                continue
+            reasons = []
+            comp_raw = row.get("checkm2_completeness")
+            cont_raw = row.get("checkm2_contamination")
+            comp = float(comp_raw) if pd.notna(comp_raw) else 0.0
+            cont = float(cont_raw) if pd.notna(cont_raw) else 100.0
+            if comp < MIN_COMPLETENESS:
+                reasons.append(f"completeness={comp:.1f}%<{MIN_COMPLETENESS:g}%")
+            if cont >= MAX_CONTAMINATION:
+                reasons.append(f"contamination={cont:.1f}%>={MAX_CONTAMINATION:g}%")
+
+            if reasons:
+                shutil.copy(src, os.path.join(output.rejected, f"{mag}.fa"))
+                log_lines.append(f"{mag}\tREJECTED\t{'; '.join(reasons)}")
+            else:
+                shutil.copy(src, os.path.join(output.filtered, f"{mag}.fa"))
+                log_lines.append(f"{mag}\tPASSED\t{row['MIMAG_tier']}")
+
+        with open(os.path.join(output.filtered, "filter_log.tsv"), "w") as fh:
+            fh.write("\n".join(log_lines))
+        open(output.done, "w").close()
+        print(f"[mag_filter] Filter complete. Log: {output.filtered}/filter_log.tsv")
+
+
+# =============================================================================
+# PHASE 6A — MAG-LEVEL ANALYSIS
+# PARALLEL OPTIMISATION:
+#   • gtdbtk, drep, coverm, and the prokka→annotation chain all start
+#     simultaneously as soon as mag_filter resolves.
+#   • barrnap_per_mag and prokka_per_mag are scatter/gather: Snakemake
+#     launches all MAG jobs concurrently (limited only by --cores).
+#   • cctyper and dbcan start per-MAG as soon as that MAG's prokka finishes.
+# =============================================================================
+
+# ── 6A-i: GTDB-Tk ────────────────────────────────────────────────────────────
+rule gtdbtk:
+    input:
+        bins = f"{FILTERED_DIR}/{{sample}}",
+        done = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    output:
+        bac  = f"{GTDB_DIR}/{{sample}}/gtdbtk.bac120.summary.tsv",
+        ar   = f"{GTDB_DIR}/{{sample}}/gtdbtk.ar53.summary.tsv"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {GTDB_DIR}/{wildcards.sample}
+        export PATH={GTDBTK_ENV}:$PATH
+        export GTDBTK_DATA_PATH={GTDBTK_DB}
+        bin_count=$(find {input.bins} -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        bin_count="${{bin_count:-0}}"
+        if [ "$bin_count" -eq 0 ]; then
+          printf "user_genome\tclassification\n" > {output.bac}
+          printf "user_genome\tclassification\n" > {output.ar}
+          echo "[gtdbtk] No filtered MAGs — writing empty summaries." >&2
+          exit 0
+        fi
+        {GTDBTK} classify_wf \
+          --genome_dir {input.bins} \
+          --out_dir {GTDB_DIR}/{wildcards.sample} \
+          --extension fa \
+          --cpus {threads} \
+          --pplacer_cpus 1
+        [ -f {output.bac} ] || printf "user_genome\tclassification\n" > {output.bac}
+        [ -f {output.ar}  ] || printf "user_genome\tclassification\n" > {output.ar}
+        """
+
+# ── 6A-ii: dRep (PARALLEL with GTDB-Tk) ──────────────────────────────────────
+rule drep:
+    input:
+        bins      = f"{FILTERED_DIR}/{{sample}}",
+        done      = f"{FILTERED_DIR}/{{sample}}.filter.done",
+        checkm2   = f"{CHECKM_DIR}/{{sample}}/quality_report.tsv"
+    output:
+        derep = directory(f"{DREP_DIR}/{{sample}}/dereplicated_genomes")
+    threads: THREADS
+    run:
+        import os, shutil, subprocess, csv as _csv
+
+        drep_env = {**os.environ,
+                    "PATH": f"{DREP_ENV}:{os.environ.get('PATH', '')}"}
+        out_base = f"{DREP_DIR}/{wildcards.sample}"
+        os.makedirs(out_base, exist_ok=True)
+
+        fa_files = sorted(
+            os.path.join(input.bins, f)
+            for f in os.listdir(input.bins)
+            if f.endswith(".fa")
+        )
+
+        if len(fa_files) == 0:
+            os.makedirs(output.derep, exist_ok=True)
+            print("[drep] No filtered MAGs — skipping dereplication.", flush=True)
+            return
+
+        if len(fa_files) == 1:
+            print("[drep] Only 1 MAG — copying directly.", flush=True)
+            os.makedirs(output.derep, exist_ok=True)
+            shutil.copy(fa_files[0], os.path.join(output.derep, os.path.basename(fa_files[0])))
+            return
+
+        if os.path.isdir(os.path.join(out_base, "log")):
+            shutil.rmtree(out_base)
+            print(f"[drep] Removed stale work dir: {out_base}", flush=True)
+        os.makedirs(out_base, exist_ok=True)
+        os.makedirs(output.derep, exist_ok=True)
+
+        genome_info_path = os.path.join(out_base, "genome_info.csv")
+        checkm2_data = {}
+        import pandas as _pd
+        ckm = _pd.read_csv(input.checkm2, sep="\t")
+        for _, row in ckm.iterrows():
+            stem = os.path.splitext(os.path.basename(str(row.get("Name", "")).strip()))[0]
+            comp_raw = row.get("Completeness")
+            cont_raw = row.get("Contamination")
+            checkm2_data[stem] = (
+                float(comp_raw) if _pd.notna(comp_raw) else 50.0,
+                float(cont_raw) if _pd.notna(cont_raw) else 5.0,
+            )
+
+        with open(genome_info_path, "w", newline="") as gh:
+            writer = _csv.writer(gh)
+            writer.writerow(["genome", "completeness", "contamination"])
+            for fa in fa_files:
+                stem = os.path.splitext(os.path.basename(fa))[0]
+                comp, cont = checkm2_data.get(stem, (50.0, 5.0))
+                writer.writerow([os.path.basename(fa), comp, cont])
+
+        def _avail(binary):
+            return subprocess.run(
+                ["bash", "-c", f"command -v {binary}"],
+                capture_output=True, env=drep_env
+            ).returncode == 0
+
+        if _avail("skani"):
+            s_algo = "skani"
+        elif _avail("fastANI"):
+            s_algo = "fastANI"
+        else:
+            s_algo = "ANImf"
+
+        cmd = [
+            DREP_BIN, "dereplicate", out_base,
+            "--genomeInfo", genome_info_path,
+            "-pa", str(DREP_PRIMARY_ANI),
+            "-sa", str(DREP_SECONDARY_ANI),
+            "-nc", str(DREP_ALIGNED_FRACTION),
+            "-comp", str(DREP_MIN_COMPLETENESS),
+            "-con", str(DREP_MAX_CONTAMINATION),
+            "--S_algorithm", s_algo,
+            "--processors", str(threads),
+        ] + ["-g"] + fa_files
+
+        print(f"[drep] Running: {' '.join(cmd)}", flush=True)
+        subprocess.run(cmd, check=True, env=drep_env)
+
+# ── 6A-iii: CoverM (PARALLEL with GTDB-Tk and dRep) ──────────────────────────
+rule coverm:
+    input:
+        bins = f"{FILTERED_DIR}/{{sample}}",
+        done = f"{FILTERED_DIR}/{{sample}}.filter.done",
+        bam  = f"{MAP_DIR}/{{sample}}.sorted.bam"
+    output:
+        tsv  = f"{COVERM_DIR}/{{sample}}/coverage.tsv"
+    threads: THREADS
+    run:
+        import os
+        out_dir = f"{COVERM_DIR}/{wildcards.sample}"
+        os.makedirs(out_dir, exist_ok=True)
+        bin_files = [
+            os.path.join(input.bins, f)
+            for f in os.listdir(input.bins)
+            if f.endswith(".fa")
+        ]
+        if not bin_files:
+            with open(output.tsv, "w") as fh:
+                fh.write("Genome\tMean\tRelative Abundance (%)\tCovered Fraction\n")
+            print("[coverm] No filtered MAGs — writing empty coverage table.")
+        else:
+            bin_str = " ".join(bin_files)
+            shell(
+                f"export PATH={COVERM_ENV}:$PATH && "
+                f"{COVERM} genome "
+                f"--bam-files {input.bam} "
+                f"--genome-fasta-files {bin_str} "
+                f"-t {threads} "
+                f"-m mean relative_abundance covered_fraction "
+                f"--min-covered-fraction 0 "
+                f"-o {output.tsv}"
+            )
+
+# ── 6A-iv: Barrnap (scatter per MAG — all run in parallel) ───────────────────
+rule barrnap_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        gff   = f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_rrna.gff",
+        fa16s = f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_16S.fa"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        export PATH={BARRNAP_ENV}:$PATH
+
+        OUTDIR="{BARRNAP_DIR}/{wildcards.sample}/{wildcards.mag}"
+        mkdir -p "$OUTDIR"
+
+        _outseq_bac="$OUTDIR/{wildcards.mag}_rrna_bac.fa"
+        _outseq_arc="$OUTDIR/{wildcards.mag}_rrna_arc.fa"
+        _gff_bac="$OUTDIR/{wildcards.mag}_rrna_bac.gff"
+        _gff_arc="$OUTDIR/{wildcards.mag}_rrna_arc.gff"
+
+        {BARRNAP_BIN} \
+          --kingdom bac \
+          --threads {threads} \
+          --lencutoff 0.5 \
+          --reject 0.1 \
+          --outseq "$_outseq_bac" \
+          {input.fasta} \
+          > "$_gff_bac" 2>> /dev/stderr || true
+
+        {BARRNAP_BIN} \
+          --kingdom arc \
+          --threads {threads} \
+          --lencutoff 0.5 \
+          --reject 0.1 \
+          --outseq "$_outseq_arc" \
+          {input.fasta} \
+          > "$_gff_arc" 2>> /dev/stderr || true
+
+        [ -f "$_outseq_bac" ] || touch "$_outseq_bac"
+        [ -f "$_outseq_arc" ] || touch "$_outseq_arc"
+        [ -f "$_gff_bac"    ] || touch "$_gff_bac"
+        [ -f "$_gff_arc"    ] || touch "$_gff_arc"
+
+        {{
+          cat "$_gff_bac"
+          grep -v '^#' "$_gff_arc" || true
+        }} > {output.gff}
+
+        _outseq_all="$OUTDIR/{wildcards.mag}_rrna_all.fa"
+        cat "$_outseq_bac" "$_outseq_arc" > "$_outseq_all"
+
+        _out16s="{output.fa16s}"
+        _mag="{wildcards.mag}"
+        python3 - "$_outseq_all" "$_out16s" "$_mag" <<'PYEOF'
+import sys, re
+
+rrna_fa, out16s, mag = sys.argv[1], sys.argv[2], sys.argv[3]
+
+IS_16S_RE = re.compile(r'16[Ss][_\s]?[rR]RNA|16[Ss]\s+ribosomal', re.IGNORECASE)
+
+seqs = []
+in_16s = False
+seq_id = ""
+seq_buf = []
+
+try:
+    with open(rrna_fa) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if in_16s and seq_buf:
+                    seqs.append((seq_id, "".join(seq_buf)))
+                seq_id = line
+                in_16s = bool(IS_16S_RE.search(line))
+                seq_buf = []
+            else:
+                if in_16s:
+                    seq_buf.append(line)
+        if in_16s and seq_buf:
+            seqs.append((seq_id, "".join(seq_buf)))
+except FileNotFoundError:
+    pass
+
+with open(out16s, "w") as out:
+    if seqs:
+        for i, (sid, seq) in enumerate(seqs, 1):
+            contig = sid.lstrip(">").split()[0]
+            length = len(seq)
+            flag = "_partial" if length < 1200 else ""
+            new_header = ">" + mag + "_" + contig + "_16S_" + str(i) + flag + " len=" + str(length)
+            out.write(new_header + "\n" + seq + "\n")
+        print("[barrnap] " + mag + ": " + str(len(seqs)) + " 16S sequence(s) written to " + out16s)
+    else:
+        out.write("# No 16S rRNA gene detected in " + mag + "\n")
+        print("[barrnap] " + mag + ": No 16S rRNA detected")
+PYEOF
+        """
+
+rule barrnap_all:
+    input:
+        lambda wildcards: expand(
+            f"{BARRNAP_DIR}/{{sample}}/{{mag}}/{{mag}}_16S.fa",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        combined = f"{BARRNAP_DIR}/{{sample}}/all_MAGs_16S_rRNA.fa",
+        summary  = f"{BARRNAP_DIR}/{{sample}}/16S_detection_summary.tsv",
+        done     = f"{BARRNAP_DIR}/{{sample}}/barrnap.done"
+    run:
+        import os, glob as _glob
+
+        total = with_full = with_partial = no_16s = 0
+        summary_rows = ["MAG\tStatus\tNum_16S\tNotes"]
+
+        with open(output.combined, "w") as out_fh:
+            for fa_path in sorted(input):
+                mag_name = os.path.basename(os.path.dirname(fa_path))
+                total += 1
+                seq_count = partial_count = 0
+                no_detect = False
+
+                with open(fa_path) as in_fh:
+                    for line in in_fh:
+                        if line.startswith("#"):
+                            no_detect = True
+                        elif line.startswith(">"):
+                            seq_count += 1
+                            if "_partial" in line:
+                                partial_count += 1
+                            out_fh.write(line)
+                        else:
+                            if not no_detect:
+                                out_fh.write(line)
+
+                if no_detect or seq_count == 0:
+                    no_16s += 1
+                    summary_rows.append(f"{mag_name}\tNone\t0\tNo 16S detected")
+                elif partial_count == seq_count:
+                    with_partial += 1
+                    summary_rows.append(f"{mag_name}\tPartial\t{seq_count}\t{partial_count} partial <1200 bp")
+                else:
+                    with_full += 1
+                    summary_rows.append(f"{mag_name}\tFull\t{seq_count}\t{partial_count} partial, {seq_count-partial_count} full")
+
+        with open(output.summary, "w") as sfh:
+            sfh.write("\n".join(summary_rows) + "\n")
+            sfh.write(f"\n# TOTAL MAGs: {total}\n# Full: {with_full}\n# Partial: {with_partial}\n# None: {no_16s}\n")
+
+        open(output.done, "w").close()
+
+# ── 6A-v: Prokka (scatter per MAG — all run in parallel) ─────────────────────
+rule prokka:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        gff = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff",
+        faa = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa",
+        ffn = f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.ffn"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {PROKKA_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={PROKKA_ENV}:$PATH
+        {PROKKA} \
+          --outdir {PROKKA_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --prefix {wildcards.mag} \
+          --metagenome \
+          --kingdom Bacteria \
+          --cpus {threads} \
+          --force \
+          --compliant \
+          {input.fasta}
+        """
+
+rule prokka_all:
+    input:
+        lambda wildcards: expand(
+            f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.gff",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{PROKKA_DIR}/{{sample}}/prokka.done"
+    shell:
+        "mkdir -p {PROKKA_DIR}/{wildcards.sample}; touch {output.done}"
+
+
+# ── 6A-vi: CCTyper (scatter per MAG — starts per-MAG as prokka .faa ready) ───
+rule cctyper_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"      # ← faa line removed
+    output:
+        done  = f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{CCTYPER_DIR}/{wildcards.sample}/{wildcards.mag}"
+        if [ -d "$OUTDIR" ]; then rm -rf "$OUTDIR"; fi
+        mkdir -p "$(dirname "$OUTDIR")"
+        export PATH={CCTYPER_ENV}:$PATH
+        echo "[CCTyper] Running on {wildcards.mag}" >&2
+       {CCTYPER_BIN} \
+          {input.fasta} \
+          "$OUTDIR" \
+          --db "{CCTYPER_DB}" \
+          -t {threads} \
+          2>&1
+        mkdir -p "$OUTDIR"
+        touch {output.done}
+        """
+
+rule cctyper_all:
+    input:
+        lambda wildcards: expand(
+            f"{CCTYPER_DIR}/{{sample}}/{{mag}}/cctyper.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{CCTYPER_DIR}/{{sample}}/cctyper.done"
+    shell:
+        "touch {output.done}"
+
+# ── 6A-vii: dbCAN (scatter per MAG — PARALLEL with cctyper) ──────────────────
+rule dbcan_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        done  = f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done"
+    threads: MAG_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {DBCAN_DIR}/{wildcards.sample}/{wildcards.mag}
+        export PATH={DBCAN_ENV}:$PATH
+        {DBCAN_BIN} \
+          {input.fasta} \
+          meta \
+          --db_dir {DBCAN_DB} \
+          --out_dir {DBCAN_DIR}/{wildcards.sample}/{wildcards.mag} \
+          --tf_cpu {threads} \
+          --dia_cpu {threads} \
+          --hmm_cpu {threads}
+        touch {output.done}
+        """
+
+rule dbcan_all:
+    input:
+        lambda wildcards: expand(
+            f"{DBCAN_DIR}/{{sample}}/{{mag}}/dbcan.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        done = f"{DBCAN_DIR}/{{sample}}/dbcan.done"
+    shell:
+        "touch {output.done}"
+
+# ── 6A-viii: ABRicate (scatter per MAG×DB — trivially parallel) ──────────────
+rule abricate:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa"
+    output:
+        tsv   = f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {ABRICATE_DIR}/{wildcards.sample}/{wildcards.db}
+        export PATH={ABRICATE_ENV}:$PATH
+        {ABRICATE} \
+          --db {wildcards.db} \
+          --minid 80 \
+          --mincov 70 \
+          {input.fasta} \
+          > {output.tsv}
+        """
+
+rule abricate_summary:
+    input:
+        lambda wildcards: expand(
+            f"{ABRICATE_DIR}/{{sample}}/{{db}}/{{mag}}.{{db}}.tsv",
+            sample=wildcards.sample,
+            db=wildcards.db,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        summary = f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv"
+    shell:
+        """
+        set -euo pipefail
+        export PATH={ABRICATE_ENV}:$PATH
+        mkdir -p {ABRICATE_DIR}/{wildcards.sample}/{wildcards.db}
+        shopt -s nullglob
+        files=({ABRICATE_DIR}/{wildcards.sample}/{wildcards.db}/*.tsv)
+        if [ "${{#files[@]}}" -eq 0 ]; then
+          printf "#FILE\tNUM_FOUND\n" > {output.summary}
+        else
+          {ABRICATE} --summary "${{files[@]}}" > {output.summary}
+        fi
+        """
+
+rule abricate_all:
+    input:
+        lambda wildcards: expand(
+            f"{ABRICATE_DIR}/{{sample}}/{{db}}_summary.tsv",
+            sample=wildcards.sample,
+            db=ABRICATE_DBS
+        )
+    output:
+        done = f"{ABRICATE_DIR}/{{sample}}/abricate.done"
+    shell:
+        "mkdir -p {ABRICATE_DIR}/{wildcards.sample}; touch {output.done}"
+
+# ── 6A-ix: HADEG (starts as soon as prokka_all done) ─────────────────────────
+rule hadeg_proteinortho:
+    input:
+        hadeg_db    = HADEG_DB,
+        prokka_done = f"{PROKKA_DIR}/{{sample}}/prokka.done",
+        mags        = lambda wc: expand(
+            f"{PROKKA_DIR}/{{sample}}/{{mag}}/{{mag}}.faa",
+            sample=wc.sample,
+            mag=get_filtered_mags(wc)
+        )
+    output:
+        tsv  = f"{HADEG_OUTDIR}/{{sample}}/Results_HADEG.proteinortho.tsv",
+        done = f"{HADEG_OUTDIR}/{{sample}}/hadeg_proteinortho.done"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {HADEG_OUTDIR}/{wildcards.sample}
+
+        HADEG_DB_ABS="{input.hadeg_db}"
+        if [ ! -f "$HADEG_DB_ABS" ]; then
+            echo "[HADEG] ERROR: database not found at $HADEG_DB_ABS" >&2
+            exit 1
+        fi
+
+        # ── Sanitize all prokka FAA files ────────────────────────────────────
+        # proteinortho >=6.3 rejects stop-codon '*' characters that prokka
+        # writes by default.  Strip them (and any other non-amino-acid chars)
+        # into a temporary clean_faa directory before calling proteinortho.
+        CLEAN_DIR="{HADEG_OUTDIR}/{wildcards.sample}/clean_faa"
+        mkdir -p "$CLEAN_DIR"
+        clean_mags=""
+        for f in {input.mags}; do
+            case "$f" in
+                /*) abs_f="$f" ;;
+                *)  abs_f="$(pwd)/$f" ;;
+            esac
+            base=$(basename "$f")
+            clean_f="$CLEAN_DIR/$base"
+            sed -E '/^>/! s/[^XOUBZACDEFGHIKLMNPQRSTVWYxoubzacdefghiklmnpqrstvwy]//g; /^$/d' \
+                "$abs_f" > "$clean_f"
+            clean_mags="$clean_mags $clean_f"
+        done
+        echo "[HADEG] Sanitized $(echo $clean_mags | wc -w) MAG FAA files → $CLEAN_DIR" >&2
+
+        # ── Also sanitize the HADEG database FAA ─────────────────────────────
+        CLEAN_DB="$CLEAN_DIR/$(basename {input.hadeg_db})"
+        sed -E '/^>/! s/[^XOUBZACDEFGHIKLMNPQRSTVWYxoubzacdefghiklmnpqrstvwy]//g; /^$/d' \
+            "$HADEG_DB_ABS" > "$CLEAN_DB"
+
+        mag_count=$(echo $clean_mags | wc -w)
+        echo "[HADEG] Running proteinortho with $mag_count MAG FAA file(s)" >&2
+        if [ "$mag_count" -eq 0 ]; then
+            echo "[HADEG] WARNING: No filtered MAG FAA files found. Writing empty TSV and skipping proteinortho." >&2
+            printf "# Species\tGenes\tAlg.-Conn.\t$(basename {input.hadeg_db})\n" \
+                > "{output.tsv}"
+            touch "{output.done}"
+            exit 0
+        fi
+
+        # ── Run proteinortho from the output directory ────────────────────────
+        cd {HADEG_OUTDIR}/{wildcards.sample}
+        PROTEINORTHO_BIN="{PROTEINORTHO}"
+        DIAMOND_BIN="{HADEG_DIAMOND}"
+        if [ "$PROTEINORTHO_BIN" != "$(basename "$PROTEINORTHO_BIN")" ]; then
+            export PATH="$(dirname "$PROTEINORTHO_BIN"):$PATH"
+        fi
+        if [ "$DIAMOND_BIN" != "$(basename "$DIAMOND_BIN")" ]; then
+            export PATH="$(dirname "$DIAMOND_BIN"):$PATH"
+        fi
+        if ! command -v diamond >/dev/null 2>&1; then
+            echo "[HADEG] ERROR: DIAMOND not found for Proteinortho HADEG run." >&2
+            exit 1
+        fi
+        "{HADEG_PYTHON}" "{HADEG_RUNNER}" \
+          --proteinortho "$PROTEINORTHO_BIN" \
+          --diamond "$DIAMOND_BIN" \
+          --workdir "$PWD" \
+          --project Results_HADEG \
+          --threads {threads} \
+          --stall-seconds {HADEG_STALL_SECONDS} \
+          --max-attempts {HADEG_MAX_ATTEMPTS} \
+          "$CLEAN_DB" $clean_mags
+
+        RESULT_TSV="{HADEG_OUTDIR}/{wildcards.sample}/Results_HADEG.proteinortho.tsv"
+        if [ ! -s "$RESULT_TSV" ]; then
+            echo "[HADEG] ERROR: $RESULT_TSV is empty or missing" >&2
+            exit 1
+        fi
+        touch "{output.done}"
+        """
+
+
+# ── 6A-x: BUSCO on filtered MAGs (scatter per MAG — PARALLEL with other 6A) ──
+# PARALLEL OPTIMISATION: Each filtered MAG is assessed independently.
+# Snakemake fans out as many busco_filtered_per_mag jobs as cores allow.
+
+rule busco_filtered_per_mag:
+    input:
+        fasta = f"{FILTERED_DIR}/{{sample}}/{{mag}}.fa",
+        done  = f"{FILTERED_DIR}/{{sample}}.filter.done"
+    output:
+        done  = f"{BUSCO_FILTERED_DIR}/{{sample}}/{{mag}}/busco_filtered.done"
+    threads: MAG_THREADS
+    params:
+        lineage = BUSCO_LINEAGE
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{BUSCO_FILTERED_DIR}/{wildcards.sample}"
+        mkdir -p "$OUTDIR"
+        export PATH={BUSCO_ENV}:$PATH
+        echo "[BUSCO-filtered] Processing {wildcards.mag}"
+        {BUSCO_BIN} \
+          -i {input.fasta} \
+          -o {wildcards.mag} \
+          --out_path "$OUTDIR" \
+          -m genome \
+          -l {params.lineage} \
+          --offline \
+          -c {threads} \
+          --force 2>&1
+        touch {output.done}
+        """
+
+rule busco_filtered_all:
+    """Gather all per-MAG BUSCO-on-filtered results and write a summary TSV."""
+    input:
+        lambda wildcards: expand(
+            f"{BUSCO_FILTERED_DIR}/{{sample}}/{{mag}}/busco_filtered.done",
+            sample=wildcards.sample,
+            mag=get_filtered_mags(wildcards)
+        )
+    output:
+        summary = f"{BUSCO_FILTERED_DIR}/{{sample}}/busco_filtered_summary.tsv",
+        done    = f"{BUSCO_FILTERED_DIR}/{{sample}}/busco_filtered_all.done"
+    run:
+        import os, re, glob as _glob
+
+        rows = ["MAG\tbusco_complete_pct\tbusco_single_pct\tbusco_duplicated_pct\tbusco_fragmented_pct\tbusco_missing_pct\tn_markers"]
+        busco_dir = f"{BUSCO_FILTERED_DIR}/{wildcards.sample}"
+        values_by_mag = {}
+
+        for summary_file in sorted(_glob.glob(
+            os.path.join(busco_dir, "**", "short_summary*.txt"), recursive=True
+        )):
+            relative = os.path.relpath(summary_file, busco_dir)
+            mag = relative.split(os.sep, 1)[0]
+            with open(summary_file) as fh:
+                content = fh.read()
+
+            vals = {"C": None, "S": None, "D": None, "F": None, "M": None, "n": None}
+            compact = re.search(
+                r"C:([\d.]+)%\[S:([\d.]+)%,D:([\d.]+)%\],F:([\d.]+)%,M:([\d.]+)%,n:(\d+)",
+                content,
+            )
+            if compact:
+                vals = dict(zip(("C", "S", "D", "F", "M", "n"), compact.groups()))
+            values_by_mag[mag] = vals
+
+        for mag, vals in sorted(values_by_mag.items()):
+            rows.append(
+                f"{mag}\t{vals['C']}\t{vals['S']}\t{vals['D']}\t{vals['F']}\t{vals['M']}\t{vals['n']}"
+            )
+
+        os.makedirs(os.path.dirname(output.summary), exist_ok=True)
+        with open(output.summary, "w") as fh:
+            fh.write("\n".join(rows) + "\n")
+        print(f"[busco_filtered_all] Written {len(rows)-1} MAG entries → {output.summary}")
+        open(output.done, "w").close()
+
+
+# =============================================================================
+# PHASE 7 — TRACK B: GENE CATALOGUE ANALYSIS
+# PARALLEL OPTIMISATION: This entire track depends only on assembly contigs
+# (from Phase 3) and the clean reads (from Phase 1).  It therefore starts
+# right after Phase 3 completes, running in parallel with all of Phase 5
+# and Phase 6A.  No dependency on filtered MAGs at all.
+# =============================================================================
+
+rule prodigal_assembly:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{{sample}}_final.contigs.fa"
+    output:
+        ffn     = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.ffn",
+        faa     = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.faa",
+        gff     = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.gff"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {PRODIGAL_DIR}/{wildcards.sample}
+
+        _contigs="{input.contigs}"
+        _out_fa="{PRODIGAL_DIR}/{wildcards.sample}/contigs_min500.fa"
+
+        python3 - "$_contigs" "$_out_fa" <<'PYEOF'
+import sys
+in_fa, out_path = sys.argv[1], sys.argv[2]
+out = []
+hdr = None
+seq_buf = []
+with open(in_fa) as fh:
+    for line in fh:
+        line = line.rstrip()
+        if line.startswith(">"):
+            if hdr and len("".join(seq_buf)) >= 500:
+                out.append(hdr)
+                out.extend(seq_buf)
+            hdr = line
+            seq_buf = []
+        else:
+            seq_buf.append(line)
+    if hdr and len("".join(seq_buf)) >= 500:
+        out.append(hdr)
+        out.extend(seq_buf)
+with open(out_path, "w") as fh:
+    fh.write("\n".join(out) + "\n")
+kept = len([x for x in out if x.startswith(">")])
+print("[prodigal_assembly] Kept " + str(kept) + " contigs >=500 bp")
+if kept == 0:
+    print("[prodigal_assembly] WARNING: no contigs >=500 bp")
+PYEOF
+
+        {PRODIGAL} \
+          -i {PRODIGAL_DIR}/{wildcards.sample}/contigs_min500.fa \
+          -a {output.faa} \
+          -d {output.ffn} \
+            -f gff \
+            -o {output.gff} \
+            -p meta
+            """
+
+rule cdhit_genes:
+    input:
+        ffn  = f"{PRODIGAL_DIR}/{{sample}}/predicted_genes.ffn"
+    output:
+        nr   = f"{CDHIT_DIR}/{{sample}}/gene_catalogue_nr.ffn",
+        clst = f"{CDHIT_DIR}/{{sample}}/gene_catalogue_nr.ffn.clstr"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {CDHIT_DIR}/{wildcards.sample}
+        {CDHIT} \
+          -i {input.ffn} \
+          -o {output.nr} \
+          -c 0.95 \
+          -aS 0.90 \
+          -n 8 \
+          -T {threads} \
+          -M 0 \
+          -d 0
+        """
+
+rule salmon_index:
+    input:
+        fasta = f"{CDHIT_DIR}/{{sample}}/gene_catalogue_nr.ffn"
+    output:
+        index = directory(f"{SALMON_DIR}/{{sample}}/index")
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {SALMON_DIR}/{wildcards.sample}
+        {SALMON} index \
+          -t {input.fasta} \
+          -i {output.index} \
+          -p {threads}
+        """
+
+rule salmon_quant:
+    input:
+        index = f"{SALMON_DIR}/{{sample}}/index",
+        r1    = f"{KNEAD_DIR}/{{sample}}_paired_1.fastq",
+        r2    = f"{KNEAD_DIR}/{{sample}}_paired_2.fastq"
+    output:
+        qsf   = f"{SALMON_DIR}/{{sample}}/quant/quant.sf"
+    threads: THREADS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {SALMON_DIR}/{wildcards.sample}/quant
+        {SALMON} quant \
+          -i {input.index} \
+          -l A \
+          -1 {input.r1} -2 {input.r2} \
+          -p {threads} \
+          --validateMappings \
+          -o {SALMON_DIR}/{wildcards.sample}/quant
+        """
+
+
+# =============================================================================
+# PHASE 8 — AGGREGATED REPORTING
+# Waits for everything; MultiQC is fast (~5 min).
+# =============================================================================
+
+rule multiqc:
+    input: MULTIQC_INPUTS
+    output:
+        report = f"{MULTIQC_DIR}/multiqc_report.html"
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {MULTIQC_DIR}
+        {MULTIQC} {OUTPUT_ROOT} \
+          --ignore "*.done" \
+          --ignore "*.bam" \
+          --ignore "*.bai" \
+          -o {MULTIQC_DIR} \
+          --force 2>&1 | tee {MULTIQC_DIR}/multiqc_run.log
+        """
+
+# =============================================================================
+# NEW RULES (ADDED FOR SERVER DEPLOYMENT UPDATE)
+# =============================================================================
+rule fastqc_raw:
+    input:
+        r1 = config["reads"]["r1"],
+        r2 = config["reads"]["r2"]
+    output:
+        html_r1 = f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+        zip_r1  = f"{RAW_QC_DIR}/{SAMPLE}_R1_fastqc.zip",
+        html_r2 = f"{RAW_QC_DIR}/{SAMPLE}_R2_fastqc.html",
+        zip_r2  = f"{RAW_QC_DIR}/{SAMPLE}_R2_fastqc.zip"
+    threads: 2
+    shell:
+        '''
+        export PATH={FASTQC_ENV}:$PATH
+        mkdir -p {RAW_QC_DIR}
+        {FASTQC} --threads {threads} --outdir {RAW_QC_DIR} {input.r1} {input.r2}
+        '''
+
+rule fastqc_clean:
+    input:
+        r1 = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq",
+        r2 = f"{FASTP_DIR}/{SAMPLE}_2.clean.fastq"
+    output:
+        html_r1 = f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.html",
+        zip_r1  = f"{CLEAN_QC_DIR}/{SAMPLE}_R1_fastqc.zip",
+        html_r2 = f"{CLEAN_QC_DIR}/{SAMPLE}_R2_fastqc.html",
+        zip_r2  = f"{CLEAN_QC_DIR}/{SAMPLE}_R2_fastqc.zip"
+    threads: 2
+    shell:
+        '''
+        export PATH={FASTQC_ENV}:$PATH
+        mkdir -p {CLEAN_QC_DIR}
+        {FASTQC} --threads {threads} --outdir {CLEAN_QC_DIR} {input.r1} {input.r2}
+        for read in R1 R2; do
+          for ext in html zip; do
+            idx="${{read#R}}"
+            src="{CLEAN_QC_DIR}/{SAMPLE}_${{idx}}.clean_fastqc.${{ext}}"
+            dst="{CLEAN_QC_DIR}/{SAMPLE}_${{read}}_fastqc.${{ext}}"
+            [ -f "$dst" ] || [ ! -f "$src" ] || cp "$src" "$dst"
+          done
+        done
+        '''
+
+rule nonpareil:
+    input:
+        r1 = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq"
+    output:
+        npa = f"{NONPAREIL_DIR}/{SAMPLE}.npa",
+        npc = f"{NONPAREIL_DIR}/{SAMPLE}.npc",
+        npl = f"{NONPAREIL_DIR}/{SAMPLE}.npl",
+        npo = f"{NONPAREIL_DIR}/{SAMPLE}.npo"
+    threads: THREADS
+    shell:
+        r'''
+        set -euo pipefail
+        export PATH={NONPAREIL_ENV}:$PATH
+        mkdir -p {NONPAREIL_DIR}
+        command -v {NONPAREIL} >/dev/null 2>&1 || {{ echo "[nonpareil] ERROR: executable unavailable: {NONPAREIL}" >&2; exit 1; }}
+        {NONPAREIL} -s {input.r1} -T kmer -f fastq -b {NONPAREIL_DIR}/{SAMPLE} -t {threads}
+        '''
+
+rule kraken2:
+    input:
+        r1 = f"{FASTP_DIR}/{SAMPLE}_1.clean.fastq",
+        r2 = f"{FASTP_DIR}/{SAMPLE}_2.clean.fastq"
+    output:
+        report = f"{KRAKEN_DIR}/{SAMPLE}_kraken2_report.tsv",
+        out    = f"{KRAKEN_DIR}/{SAMPLE}_kraken2.out"
+    threads: THREADS
+    shell:
+        r'''
+        set -euo pipefail
+        export PATH={KRAKEN_ENV}:$PATH
+        mkdir -p {KRAKEN_DIR}
+        [ -f {KRAKEN2_DB}/taxo.k2d ] || {{ echo "[kraken2] ERROR: database missing: {KRAKEN2_DB}" >&2; exit 1; }}
+        command -v {KRAKEN2} >/dev/null 2>&1 || {{ echo "[kraken2] ERROR: executable unavailable: {KRAKEN2}" >&2; exit 1; }}
+        {KRAKEN2} --db {KRAKEN2_DB} --threads {threads} --paired {input.r1} {input.r2} {KRAKEN_CONFIDENCE_FLAG} {KRAKEN_MIN_HIT_GROUPS_FLAG} --report {output.report} --output {output.out}
+        '''
+
+rule bracken:
+    input:
+        report = f"{KRAKEN_DIR}/{SAMPLE}_kraken2_report.tsv"
+    output:
+        species = f"{KRAKEN_DIR}/{SAMPLE}_bracken_species.tsv"
+    shell:
+        r'''
+        set -euo pipefail
+        export PATH={KRAKEN_ENV}:$PATH
+        [ -f {KRAKEN2_DB}/database{BRACKEN_READ_LENGTH}mers.kmer_distrib ] || {{ echo "[bracken] ERROR: {BRACKEN_READ_LENGTH}-bp database index is missing." >&2; exit 1; }}
+        command -v {BRACKEN} >/dev/null 2>&1 || {{ echo "[bracken] ERROR: executable unavailable: {BRACKEN}" >&2; exit 1; }}
+        {BRACKEN} -d {KRAKEN2_DB} -i {input.report} -o {output.species} -l {BRACKEN_LEVEL} -t {BRACKEN_THRESHOLD} -r {BRACKEN_READ_LENGTH}
+        '''
+
+rule semibin2:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa",
+        bam     = f"{MAP_DIR}/{SAMPLE}.sorted.bam",
+        bai     = f"{MAP_DIR}/{SAMPLE}.sorted.bam.bai"
+    output:
+        bins = directory(f"{BIN_DIR}/{SAMPLE}/semibin2"),
+        done = f"{BIN_DIR}/{SAMPLE}/semibin2.done",
+        tsv  = f"{BIN_DIR}/{SAMPLE}/semibin2_contig2bin.tsv"
+    threads: THREADS
+    shell:
+        '''
+        export PATH={BINNING_ENV}:$PATH
+        mkdir -p {output.bins}
+        {SEMIBIN2} single_easy_bin --input-fasta {input.contigs} --input-bam {input.bam} --output {BIN_DIR}/{SAMPLE}/semibin2_tmp --threads {threads} --min-len {SEMIBIN_MIN_LEN}
+        # Normalize outputs to fasta pattern
+        find {BIN_DIR}/{SAMPLE}/semibin2_tmp/output_bins -name "*.fa" -exec cp {{}} {output.bins}/ \\; || true
+        # Generate contig2bin definition safely
+        > {output.tsv}
+        for f in {output.bins}/*.fa; do
+          [ -f "$f" ] || continue
+          bin=$(basename "$f" .fa)
+          awk '/^>/{{split($1,a,">");print a[2]"\\t"bin}}' bin="$bin" "$f" >> {output.tsv}
+        done
+        touch {output.done}
+        '''
+
+rule virsorter2:
+    input:
+        contigs = f"{ASSEMBLY_DIR}/{SAMPLE}_final.contigs.fa"
+    output:
+        done = f"{VIRAL_DIR}/{SAMPLE}/virsorter2.done"
+    threads: THREADS
+    shell:
+        r'''
+        set -euo pipefail
+        export PATH={VIRSORTER2_ENV}:$PATH
+        workdir="{VIRAL_DIR}/{SAMPLE}/virsorter2"
+        db_runtime="{VIRAL_DIR}/{SAMPLE}/virsorter_db_runtime"
+        rm -rf "$workdir" "$db_runtime"
+        mkdir -p "$workdir" "$db_runtime/conda_envs"
+
+        # VirSorter writes internal environments below --db-dir. Keep the
+        # reference database read-only and expose it through writable links.
+        for item in {VIRSORTER2_DB}/*; do
+          [ -e "$item" ] || continue
+          [ "$(basename "$item")" = "conda_envs" ] && continue
+          ln -sfn "$item" "$db_runtime/$(basename "$item")"
+        done
+        for item in {VIRSORTER2_DB}/conda_envs/*; do
+          [ -e "$item" ] || continue
+          ln -sfn "$item" "$db_runtime/conda_envs/$(basename "$item")"
+        done
+
+        {VIRSORTER2} run -i {input.contigs} -w "$workdir" -j {threads} --db-dir "$db_runtime" --min-length {VIRSORTER_MIN_LENGTH} --min-score {VIRSORTER_MIN_SCORE} all
+        touch {output.done}
+        '''
+
+rule gunc:
+    input:
+        bins = f"{DAS_DIR}/{SAMPLE}_DASTool_bins_clean"
+    output:
+        report = f"{GUNC_DIR}/{SAMPLE}/gunc_maxcss.tsv"
+    threads: THREADS
+    shell:
+        r'''
+        set -euo pipefail
+        export PATH={GUNC_ENV}:$PATH
+        mkdir -p {GUNC_DIR}/{SAMPLE}/tmp {GUNC_DIR}/{SAMPLE}/output
+        bin_count=$(find {input.bins} -maxdepth 1 -name "*.fa" | wc -l | tr -d '[:space:]')
+        bin_count="${{bin_count:-0}}"
+        if [ "$bin_count" -eq 0 ]; then
+          printf "genome\tclade_separation_score\tpass.GUNC\n" > {output.report}
+          echo "[gunc] No final bins — writing an empty report." >&2
+          exit 0
+        fi
+        {GUNC_BIN} run --input_dir {input.bins} --file_suffix .fa --db_file {GUNC_DB} --threads {threads} --min_mapped_genes {GUNC_MIN_MAPPED_GENES} --temp_dir {GUNC_DIR}/{SAMPLE}/tmp --out_dir {GUNC_DIR}/{SAMPLE}/output
+        shopt -s nullglob
+        reports=({GUNC_DIR}/{SAMPLE}/output/GUNC.*.maxCSS_level.tsv)
+        if [ "${{#reports[@]}}" -eq 0 ]; then
+          echo "[gunc] ERROR: expected maxCSS report was not produced." >&2
+          exit 1
+        fi
+        cp "${{reports[0]}}" {output.report}
+        '''
