@@ -1,0 +1,10 @@
+name: seqkit_env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - seqkit=2.10.0=h9ee0642_0
+prefix: /home/rashmi/.conda/envs/seqkit_env

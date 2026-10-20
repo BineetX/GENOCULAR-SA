@@ -1,0 +1,50 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  portable-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/app/package-lock.json
+      - name: Validate scripts and Python syntax
+        run: |
+          bash -n Setup.sh scripts/*.sh infra/minio/entrypoint.sh
+          python -m compileall -q api runner scripts
+      - name: Run API and runner unit tests
+        run: |
+          python -m pip install -r api/requirements.txt -r runner/requirements.txt
+          (cd api && python -m unittest discover -s . -p 'test_*.py')
+          (cd runner && python -m unittest discover -s . -p 'test_*.py')
+      - name: Generate test configuration
+        env:
+          VITE_FIREBASE_API_KEY: test-api-key
+          VITE_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
+          VITE_FIREBASE_PROJECT_ID: test-project
+          VITE_FIREBASE_APP_ID: 1:test:web:test
+        run: |
+          python scripts/configure_env.py --host 127.0.0.1 --accelerator cpu
+          python scripts/validate_env.py
+          docker compose --env-file .env -f compose.yml config --quiet
+          docker compose --env-file .env -f compose.yml -f compose.gpu.yml config --quiet
+      - name: Build frontend
+        working-directory: web/app
+        env:
+          VITE_FIREBASE_API_KEY: test-api-key
+          VITE_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
+          VITE_FIREBASE_PROJECT_ID: test-project
+          VITE_FIREBASE_APP_ID: 1:test:web:test
+        run: |
+          npm ci
+          node --test $(find src -type f \( -name '*.test.js' -o -name '*.test.mjs' \) -print)
+          npm run build

@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "wgs:short",
+  "sample": "DEMO_ECOLI_SHORT",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example short-read isolate workflow with QC, assembly, genome QC, taxonomy, and annotation outputs."
+}

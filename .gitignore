@@ -1,0 +1,43 @@
+# Generated local configuration and credentials
+.env
+.env.*
+!.env.example
+databases.env
+secrets/
+*.pem
+*.key
+*.p12
+
+# Runtime and downloaded data
+data/
+backups/
+*.log
+*.pid
+*.sqlite*
+
+# Language/build output
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+.venv/
+venv/
+**/node_modules/
+**/dist/
+coverage/
+*.tsbuildinfo
+
+# Workflow state and local tooling
+.snakemake/
+.agents/
+.codex/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

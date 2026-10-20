@@ -1,0 +1,33 @@
+.updated-dashboard > div {
+  max-width: none !important;
+  padding: 0 !important;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+}
+
+.updated-dashboard h2,
+.updated-dashboard h3 {
+  margin: 0 0 12px !important;
+  text-align: left !important;
+  font: 600 13px Inter, ui-sans-serif, system-ui, sans-serif !important;
+  color: #334155 !important;
+}
+
+.updated-dashboard[data-dashboard-family="wgs"] > div > div {
+  margin-bottom: 24px !important;
+  gap: 24px !important;
+}
+
+.updated-dashboard[data-dashboard-family="wgs"] > div > div[style*="border-top"] {
+  border-top: 1px solid #e2e8f0 !important;
+  padding-top: 24px !important;
+}
+
+.updated-dashboard[data-dashboard-family="wgs"] > div > div:last-child {
+  margin-bottom: 0 !important;
+}
+
+@media (max-width: 640px) {
+  .updated-dashboard[data-dashboard-family="meta"] > div[style*="display: flex"] {
+    flex-wrap: wrap;
+  }
+}

@@ -1,0 +1,994 @@
+#!/usr/bin/env python
+import os, json, mimetypes
+from pathlib import Path
+
+# ===========================
+# Required config
+# ===========================
+required = ["sample", "R1", "R2", "JOB_ID", "BASE"]
+for k in required:
+    if "config" not in globals() or k not in config or not config[k]:
+        raise ValueError(f"Missing --config {k}=...")
+
+sample  = str(config["sample"])
+R1      = str(config["R1"])
+R2      = str(config["R2"])
+JOB_ID  = str(config["JOB_ID"])
+BASE    = str(config["BASE"])  
+
+# Canonical job root: /data/genoverse/jobs/<JOB_ID>/OUTPUT/<sample>/
+base_path = Path(BASE).expanduser().resolve()
+job_root  = base_path / "jobs" / JOB_ID / "OUTPUT" / sample
+job_root.mkdir(parents=True, exist_ok=True)
+
+def P(*parts) -> str:
+    "Path helper under job_root"
+    return str(job_root.joinpath(*parts))
+
+def get_sample_fastq(read: str) -> str:
+    path = R1 if read == "R1" else R2
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing input file: {path}")
+    return path
+
+# ===========================
+# Vendored CRISPRCasFinder path
+# ===========================
+#BASE_DIR   = Path(__file__).parent.resolve()
+try:
+    BASE_DIR = Path(workflow.basedir).resolve()
+except NameError:
+    BASE_DIR = Path(os.getcwd()).resolve()
+
+
+CRISPR_DIR = (BASE_DIR / "crispr").resolve()
+
+#CRISPR_DIR = (BASE_DIR / "workflow" / "crispr").resolve()
+
+# ===========================
+# DB / Tool paths ( /dbs bind: host /data/dbs -> container /dbs)
+# ===========================
+TRIMMOMATIC_JAR = "/dbs/trimmomatic-0.39.jar"
+ADAPTER_FILE    = "/dbs/adapters/TruSeq3-PE-2.fa"
+KRAKEN_DB_PATH    = "/dbs/kraken_bacteria_db"
+KRAKEN_TOOLS_PATH = "/dbs/KrakenTools"
+
+BUSCO_LINEAGE   = "/dbs/busco_bacteria_odb12"
+
+KOFAM_PROFILE   = "/dbs/kofamscan_db/profiles"
+KOFAM_KO_LIST   = "/dbs/kofamscan_db/ko_list"
+
+ANTISMASH_DB    = "/dbs/antismash_db"
+
+ABRICATE_DB_DIR = "/dbs/abricate_db"
+
+# If you have a local dbCAN DB; else remove --db_dir in the rule
+DBCAN_DB_DIR    = "/dbs/dbcan_db/db"
+
+# ===========================
+# Status writer 
+# ===========================
+PY      = os.environ.get("STATUS_PY", "/data/genoverse/smk_envs_v4/status/bin/python")
+STATUS = os.environ.get("STATUS_WRITER", "/project/runner/status_writer.py")
+
+# Use bash for consistent set -e/pipefail handling
+shell.executable("/bin/bash")
+
+# ===========================
+# Convenience output paths 
+# ===========================
+paired_R1       = P(f"{sample}_R1_paired.fastq")
+unpaired_R1     = P(f"{sample}_R1_unpaired.fastq")
+paired_R2       = P(f"{sample}_R2_paired.fastq")
+unpaired_R2     = P(f"{sample}_R2_unpaired.fastq")
+
+trimmed_R1      = P(f"{sample}_R1_trimmed.fastq")
+trimmed_R2      = P(f"{sample}_R2_trimmed.fastq")
+
+seqtk_R1        = P(f"{sample}_R1_seqtk_trimmed.fastq")
+seqtk_R2        = P(f"{sample}_R2_seqtk_trimmed.fastq")
+
+bbduk_R1        = P(f"{sample}_R1_bbduk_cleaned.fastq")
+bbduk_R2        = P(f"{sample}_R2_bbduk_cleaned.fastq")
+
+kraken_report   = P("kraken_output", "report.txt")
+kraken_out      = P("kraken_output", "output.kraken")
+
+classified_R1   = P("kraken_classified", f"{sample}_classified_R1.fastq")
+classified_R2   = P("kraken_classified", f"{sample}_classified_R2.fastq")
+
+spades_contigs  = P("spades_output", "contigs.fasta")
+
+prokka_gff      = P("prokka", "annotated_genome.gff")
+prokka_faa      = P("prokka", "annotated_genome.faa")
+
+repeatmasker_gff   = P("repeatmasker", "repeatmasker_output.gff")
+repeatmasker_mask  = P("repeatmasker", "contigs.masked.fasta")
+
+interpro_tsv    = P("interproscan", "interproscan_results.tsv")
+interpro_xml    = P("interproscan", "interproscan_results.xml")
+interpro_gff3   = P("interproscan", "interproscan_results.gff3")
+
+quast_report    = P("quast", "report.html")
+
+busco_summary   = P("busco", f"{sample}_busco_output", "short_summary.txt")
+busco_outdir    = P("busco")
+
+checkm_input    = P("checkm_input", "contigs.fasta")
+checkm_summary  = P("checkm_output", "checkm_summary.txt")
+
+prodigal_coords   = P("prodigal", "genes.coords")
+prodigal_proteins = P("prodigal", "proteins.faa")
+prodigal_genes    = P("prodigal", "genes.fna")
+
+abricate_resfinder     = P("abricate", "abricate_resfinder.csv")
+abricate_ncbi          = P("abricate", "abricate_ncbi.csv")
+abricate_card          = P("abricate", "abricate_card.csv")
+abricate_vfdb          = P("abricate", "abricate_vfdb.csv")
+abricate_plasmidfinder = P("abricate", "abricate_plasmidfinder.csv")
+
+kofamscan_out = P("kofamscan", "kofamscan_results.txt")
+
+dbcan_outdir   = P("dbcan", "run_dbcan_out")
+dbcan_overview = P("dbcan", "overview.txt")
+
+crispr_summary = P("crispr_output", "crispr_summary.txt")
+
+antismash_dir   = P("antismash_results")
+antismash_txt   = P("antismash_results", "index.html") 
+
+final_report   = P("final_report.txt")
+
+logdir         = P("logs")
+manifest_path = P("manifest.json")
+
+# ===========================
+# Default target
+# ===========================
+rule all:
+    input:
+        spades_contigs,
+        kraken_report,
+        kraken_out,
+        prokka_gff,
+        interpro_tsv,
+        busco_summary,
+        checkm_summary,
+        prodigal_coords,
+        prodigal_proteins,
+        prodigal_genes,
+        abricate_resfinder,
+        abricate_ncbi,
+        abricate_card,
+        abricate_vfdb,
+        abricate_plasmidfinder,
+        kofamscan_out,
+        dbcan_overview,
+        #crispr_summary,
+        antismash_txt,
+        repeatmasker_mask,
+        quast_report,
+        final_report,
+        manifest_path
+
+# ========== RULES (params for status invocations) ==========
+rule trimmomatic:
+    input:
+        R1=lambda wc: get_sample_fastq('R1'),
+        R2=lambda wc: get_sample_fastq('R2')
+    output:
+        paired_R1=paired_R1,
+        unpaired_R1=unpaired_R1,
+        paired_R2=paired_R2,
+        unpaired_R2=unpaired_R2
+    params:
+        adapter_file=ADAPTER_FILE,
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="trimmomatic",
+        summary="Trim/adapters & quality"
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        f"{logdir}/trimmomatic.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.paired_R1})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        java -jar {TRIMMOMATIC_JAR} PE \
+          -phred33 -threads {threads} \
+          {input.R1} {input.R2} \
+          {output.paired_R1} {output.unpaired_R1} \
+          {output.paired_R2} {output.unpaired_R2} \
+          ILLUMINACLIP:{params.adapter_file}:2:30:10 \
+          LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:50 &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule cutadapt_paired:
+    input:
+        paired_R1=paired_R1,
+        paired_R2=paired_R2
+    output:
+        trimmed_R1=trimmed_R1,
+        trimmed_R2=trimmed_R2
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="cutadapt_paired",
+        summary="Adapter/quality trim (Cutadapt)"
+    conda: "envs/cutadapt.yml"
+    threads: 64
+    log:
+        f"{logdir}/cutadapt_paired.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.trimmed_R1})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        cutadapt -q 20 -o {output.trimmed_R1} -p {output.trimmed_R2} \
+          {input.paired_R1} {input.paired_R2} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule seqtk_trim:
+    input:
+        trimmed_R1=trimmed_R1,
+        trimmed_R2=trimmed_R2
+    output:
+        trimmed_R1_seqtk=seqtk_R1,
+        trimmed_R2_seqtk=seqtk_R2
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="seqtk_trim",
+        summary="Seqtk soft trimming"
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        f"{logdir}/seqtk_trim.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.trimmed_R1_seqtk})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        {{ 
+            seqtk trimfq {input.trimmed_R1} > {output.trimmed_R1_seqtk}
+            seqtk trimfq {input.trimmed_R2} > {output.trimmed_R2_seqtk} 
+        }}&> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+
+rule bbduk:
+    input:
+        trimmed_R1_seqtk=seqtk_R1,
+        trimmed_R2_seqtk=seqtk_R2
+    output:
+        cleaned_R1=bbduk_R1,
+        cleaned_R2=bbduk_R2
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        P("logs", "bbduk.log")
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID, step="bbduk", summary="BBDuk decontamination"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.cleaned_R1})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --name "BBDuk"
+        set +e
+        bbduk.sh in={input.trimmed_R1_seqtk} in2={input.trimmed_R2_seqtk} \
+          out={output.cleaned_R1} out2={output.cleaned_R2} \
+          ref=adapters ktrim=r k=23 mink=11 hdist=1 tpe tbo &> {log}
+        rc=$?
+        set -e
+        if [ $rc -ne 0 ]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --name "BBDuk" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}" --name "BBDuk"
+        """
+
+
+rule kraken_classify:
+    input:
+        R1=bbduk_R1,
+        R2=bbduk_R2
+    output:
+        report=kraken_report,
+        kraken_output=kraken_out
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="kraken_classify",
+        summary="Kraken2 Classification",
+        db_path=KRAKEN_DB_PATH
+    conda: "envs/kraken2_env.yml"
+    threads: 8
+    log:
+        f"{logdir}/kraken_classify.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.report})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        
+        kraken2 \
+          --db {params.db_path} \
+          --threads {threads} \
+          --paired {input.R1} {input.R2} \
+          --use-names \
+          --memory-mapping \
+          --report {output.report} \
+          --output {output.kraken_output} &> {log}
+          
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule kraken_extract_reads:
+    input:
+        kraken_output=kraken_out,
+        R1=bbduk_R1,
+        R2=bbduk_R2
+    output:
+        classified_R1=classified_R1,
+        classified_R2=classified_R2
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="kraken_extract",
+        summary="Extract Bacteria Reads",
+        tools_path=KRAKEN_TOOLS_PATH
+    conda: "envs/kraken2_env.yml"
+    threads: 4
+    log:
+        f"{logdir}/kraken_extract.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.classified_R1})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        
+        python {params.tools_path}/extract_kraken_reads.py \
+            -k {input.kraken_output} \
+            -s {input.R1} \
+            -s2 {input.R2} \
+            -o {output.classified_R1} \
+            -o2 {output.classified_R2} \
+            --fastq-output -t 0 --exclude &> {log}
+            
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule spades:
+    input:
+        cleaned_R1=classified_R1,
+        cleaned_R2=classified_R2
+    output:
+        contigs=spades_contigs
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="spades",
+        summary="SPAdes assembly"
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        f"{logdir}/spades.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.contigs})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        spades.py --careful --cov-cutoff auto --only-assembler \
+          -t {threads} -m 50 \
+          -1 {input.cleaned_R1} -2 {input.cleaned_R2} \
+          -o $(dirname {output.contigs}) &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule prokka:
+    input:
+        contigs=spades_contigs
+    output:
+        gff=prokka_gff,
+        faa=prokka_faa
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="prokka",
+        summary="Prokka annotation"
+    conda: "envs/prokka.yml"
+    threads: 64
+    log:
+        f"{logdir}/prokka.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.gff})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        prokka --outdir $(dirname {output.gff}) --force --prefix annotated_genome \
+          --cpus {threads} {input.contigs} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule repeatmasker:
+    input:
+        contigs=spades_contigs
+    output:
+        gff=repeatmasker_gff,
+        masked_fasta=repeatmasker_mask
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="repeatmasker",
+        summary="RepeatMasker"
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        f"{logdir}/repeatmasker.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.gff})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        RepeatMasker -species all -gff -dir $(dirname {output.gff}) {input.contigs} &> {log}
+        rc=$?
+        # normalize filenames
+        [ -f $(dirname {output.gff})/$(basename {input.contigs}).out.gff ] && \
+          mv $(dirname {output.gff})/$(basename {input.contigs}).out.gff {output.gff} || true
+        [ -f $(dirname {output.gff})/$(basename {input.contigs}).masked ] && \
+          mv $(dirname {output.gff})/$(basename {input.contigs}).masked {output.masked_fasta} || true
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule interproscan:
+    input:
+        faa=prokka_faa
+    output:
+        tsv=interpro_tsv,
+        xml=interpro_xml,
+        gff3=interpro_gff3
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="interproscan",
+        summary="InterProScan domains"
+    conda: "envs/interproscan_env.yml"
+    threads: 64
+    log:
+        f"{logdir}/interproscan.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.tsv})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        interproscan.sh -i {input.faa} -b $(dirname {output.tsv})/interproscan_results \
+          -f TSV,XML,GFF3 -t p \
+          -appl Pfam,TIGRFAM,Gene3D,PANTHER,SMART,CDD,ProSiteProfiles,ProSitePatterns \
+          -iprlookup -goterms -pa --cpu {threads} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule quast:
+    input:
+        contigs=spades_contigs
+    output:
+        report=quast_report
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="quast",
+        summary="QUAST assembly QC"
+    conda: "envs/quast.yml"
+    threads: 64
+    log:
+        f"{logdir}/quast.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.report})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        quast -o $(dirname {output.report}) {input.contigs} --threads {threads} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule busco:
+    input:
+        contigs=spades_contigs
+    output:
+        summary=busco_summary
+    params:
+        outdir=busco_outdir,
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="busco",
+        summary="BUSCO completeness"
+    conda: "envs/busco.yml"
+    threads: 64
+    log:
+        f"{logdir}/busco.log"
+    shell:
+        r"""
+        mkdir -p "{params.outdir}" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+
+        set +e
+        busco -i {input.contigs} \
+          -o {sample}_busco_output \
+          -m genome \
+          -l {BUSCO_LINEAGE} \
+          --out_path {params.outdir} \
+          --offline -f --cpu {threads} &> {log}
+        rc=$?
+        set -e
+
+        if [[ $rc -ne 0 ]]; then
+          {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"
+          exit $rc
+        fi
+
+        # --- NEW: normalize BUSCO summary filename for Snakemake ---
+        BUSCO_RUN="{params.outdir}/{sample}_busco_output"
+        SUM="$(ls -1 "$BUSCO_RUN"/short_summary*.txt 2>/dev/null | head -n 1 || true)"
+        if [[ -z "$SUM" ]]; then
+          echo "ERROR: BUSCO summary not found in $BUSCO_RUN" >&2
+          ls -la "$BUSCO_RUN" >&2 || true
+          {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Missing BUSCO short_summary"
+          exit 2
+        fi
+        cp -f "$SUM" "{output.summary}"
+
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+
+rule prepare_checkm_input:
+    input:
+        contigs=spades_contigs
+    output:
+        prepared=checkm_input
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="prepare_checkm_input",
+        summary="Prep CheckM input"
+    log:
+        f"{logdir}/prepare_checkm_input.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.prepared})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        cp {input.contigs} {output.prepared} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule checkm:
+    input:
+        contigs=checkm_input
+    output:
+        summary=checkm_summary
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="checkm",
+        summary="CheckM contamination/completeness"
+    threads: 64
+    conda: "envs/checkm.yml"
+    log:
+        f"{logdir}/checkm.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.summary})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        checkm lineage_wf -x fasta --threads {threads} \
+          $(dirname {input.contigs}) $(dirname {output.summary}) &> {log}
+        # store key stats
+        [ -f $(dirname {output.summary})/storage/bin_stats_ext.json ] && \
+          tail -n +1 $(dirname {output.summary})/storage/bin_stats_ext.json > {output.summary} || true
+        # summary table
+        if [ -f $(dirname {output.summary})/lineage.ms ]; then
+          checkm qa $(dirname {output.summary})/lineage.ms $(dirname {output.summary}) \
+            -o 2 -f $(dirname {output.summary})/checkm_summary.txt --tab_table
+        fi
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule prodigal:
+    input:
+        contigs=spades_contigs
+    output:
+        coords=prodigal_coords,
+        proteins=prodigal_proteins,
+        genes=prodigal_genes
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="prodigal",
+        summary="Prodigal gene calling"
+    conda: "envs/marine.yml"
+    threads: 64
+    log:
+        f"{logdir}/prodigal.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.coords})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        prodigal -i {input.contigs} -o {output.coords} \
+          -a {output.proteins} -d {output.genes} -p single -q &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule abricate:
+    input:
+        contigs=spades_contigs
+    output:
+        resfinder=abricate_resfinder,
+        ncbi=abricate_ncbi,
+        card=abricate_card,
+        vfdb=abricate_vfdb,
+        plasmidfinder=abricate_plasmidfinder
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="abricate",
+        summary="ABRicate AMR/VF",
+        abricate_db=ABRICATE_DB_DIR
+    conda: "envs/abricate-env.yml"
+    threads: 64
+    log:
+        f"{logdir}/abricate.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.resfinder})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        export ABRICATE_DB="{params.abricate_db}"
+        abricate --db resfinder     --minid 90 --csv --threads {threads} {input.contigs} > {output.resfinder}
+        abricate --db ncbi          --minid 90 --csv --threads {threads} {input.contigs} > {output.ncbi}
+        abricate --db card          --minid 90 --csv --threads {threads} {input.contigs} > {output.card}
+        abricate --db vfdb          --minid 90 --csv --threads {threads} {input.contigs} > {output.vfdb}
+        abricate --db plasmidfinder --minid 90 --csv --threads {threads} {input.contigs} > {output.plasmidfinder}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule kofamscan:
+    input:
+        proteins=prodigal_proteins
+    output:
+        kofamscan_results=kofamscan_out
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="kofamscan",
+        summary="KofamScan KEGG KO",
+        profile=KOFAM_PROFILE,
+        ko_list=KOFAM_KO_LIST,
+        outdir=P("kofamscan")
+    conda: "envs/kofamscan_env.yml"
+    threads: 64
+    log:
+        f"{logdir}/kofamscan.log"
+    shell:
+        r"""
+        mkdir -p "{params.outdir}" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        exec_annotation -f detail-tsv \
+          -o {output.kofamscan_results} \
+          -p {params.profile} \
+          -k {params.ko_list} \
+          --cpu {threads} {input.proteins} &> {log}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+rule dbcan:
+    input:
+        faa=prokka_faa
+    output:
+        overview=dbcan_overview
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="dbcan",
+        summary="dbCAN CAZy",
+        db_dir=DBCAN_DB_DIR,
+        outdir=P("dbcan", "run_dbcan_out")
+    conda: "envs/dbcan.yml"
+    threads: 64
+    log:
+        f"{logdir}/dbcan.log"
+    shell:
+        r"""
+        set -euo pipefail
+
+        mkdir -p "{params.outdir}" "$(dirname {output.overview})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+
+        # Run dbCAN
+        run_dbcan "{input.faa}" protein \
+          --out_dir "{params.outdir}" \
+          --db_dir "{params.db_dir}" \
+          --dia_cpu {threads} --hmm_cpu {threads} --tf_cpu {threads} &> "{log}"
+
+        # Find overview file wherever dbCAN wrote it (different versions place it differently)
+        OV="$(find "{params.outdir}" -maxdepth 5 -type f -iname 'overview*' | head -n 1 || true)"
+
+        if [[ -z "$OV" ]]; then
+          echo "ERROR: dbCAN finished but no overview* was produced under {params.outdir}" >> "{log}"
+          echo "DEBUG: listing {params.outdir} (depth<=2)" >> "{log}"
+          find "{params.outdir}" -maxdepth 2 -type f -print >> "{log}" || true
+          {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Missing overview*"
+          exit 2
+        fi
+
+        cp -f "$OV" "{output.overview}"
+
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+
+
+rule crispr:
+    input:
+        contigs = spades_contigs
+    output:
+        crispr_output = crispr_summary
+    params:
+        PY      = PY,
+        STATUS  = STATUS,
+        JOB_ID  = JOB_ID,
+        step    = "crispr",
+        summary = "CRISPRCasFinder",
+        crispr_dir = CRISPR_DIR.as_posix()
+    conda:
+        "envs/crisprcasfinder.yml"
+    threads: 64
+    log:
+        f"{logdir}/crispr.log"
+    shell:
+        r"""
+        set -euo pipefail
+
+        mkdir -p "$(dirname {output.crispr_output})" "$(dirname {log})"
+
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+
+        set +e
+
+
+        export CRISPR_DIR="{params.crispr_dir}"
+        export PATH="${{CRISPR_DIR}}:$PATH"
+        export PERL5LIB="${{CRISPR_DIR}}:${{PERL5LIB:-}}"
+        export LD_LIBRARY_PATH="${{CRISPR_DIR}}:${{LD_LIBRARY_PATH:-}}"
+
+
+        if [ ! -x "${{CRISPR_DIR}}/CRISPRCasFinder.pl" ] || [ ! -f "${{CRISPR_DIR}}/sel392v2.so" ]; then
+          echo "[CRISPR] CRISPRCasFinder or sel392v2.so missing in $CRISPR_DIR – skipping CRISPR step." | tee -a {log}
+          : > "{output.crispr_output}"
+          {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}" --msg "CRISPR skipped (tool/models missing)"
+          exit 0
+        fi
+
+        # Extra PATH sanity
+        if ! command -v CRISPRCasFinder.pl >/dev/null 2>&1; then
+          echo "[CRISPR] CRISPRCasFinder.pl not on PATH (but exists). Skipping." | tee -a {log}
+          : > "{output.crispr_output}"
+          {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}" --msg "CRISPR skipped (not on PATH)"
+          exit 0
+        fi
+
+        parent_dir="$(dirname {output.crispr_output})"
+        run_dir="${{parent_dir}}/run_$(date +%s%N)_$RANDOM"
+        mkdir -p "$run_dir"
+
+        # Limit runtime so it can never hang forever (e.g. 6 hours = 21600 s)
+        TIMEOUT=21600
+
+        echo "[CRISPR] Running CRISPRCasFinder in $run_dir with timeout ${TIMEOUT}s" >> {log}
+
+        timeout --foreground "$TIMEOUT" \
+          CRISPRCasFinder.pl \
+            -i {input.contigs} \
+            -o "$run_dir" \
+            -cas -keep \
+            -soFile "${{CRISPR_DIR}}/sel392v2.so" &>> {log}
+        rc=$?
+
+        if [ "$rc" -eq 124 ]; then
+          echo "[CRISPR] CRISPRCasFinder timed out after ${TIMEOUT}s" >> {log}
+        fi
+
+        if [ -f "$run_dir/TSV/Crisprs_REPORT.tsv" ]; then
+          mv "$run_dir/TSV/Crisprs_REPORT.tsv" "{output.crispr_output}"
+        else
+          echo "[CRISPR] No Crisprs_REPORT.tsv found – writing empty summary." >> {log}
+          : > "{output.crispr_output}"
+        fi
+
+        # Clean up temp directory
+        rm -rf "$run_dir"
+
+        set -e
+
+        if [[ $rc -ne 0 ]]; then
+          {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "CRISPRCasFinder exit $rc"
+          exit $rc
+        fi
+
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+
+
+rule antismash:
+    input:
+        contigs=spades_contigs
+    output:
+        antismash_results=antismash_txt
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="antismash",
+        summary="antiSMASH BGCs",
+        output_dir=antismash_dir,
+        antismash_db=ANTISMASH_DB
+    conda: "envs/antismash8.yml"
+    threads: 64
+    log:
+        f"{logdir}/antismash.log"
+    shell:
+        r"""
+        set -euo pipefail
+
+        export ANTISMASH_DATABASES="{params.antismash_db}"
+        mkdir -p "{params.output_dir}" "$(dirname {output.antismash_results})" "$(dirname {log})"
+
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+
+        antismash "{input.contigs}" \
+          --output-dir "{params.output_dir}" \
+          --genefinding-tool prodigal \
+          --taxon bacteria \
+          --cb-knownclusters --cb-subclusters --cb-general \
+          --cc-mibig --fullhmmer --clusterhmmer \
+          --asf --pfam2go --enable-genefunctions --tigrfam --tfbs --rre --smcog-trees \
+          --enable-nrps-pks --enable-lanthipeptides --enable-lassopeptides \
+          --enable-thiopeptides --enable-terpene --enable-html \
+          --cpus {threads} &> "{log}"
+
+        # antiSMASH v8 often writes knownclusterblast text inside a subfolder
+        KCB="$(find "{params.output_dir}" -maxdepth 6 -type f \( -iname 'knownclusterblast*.txt' -o -iname 'knownclusterblast*.tsv' \) | head -n 1 || true)"
+
+        if [[ -z "$KCB" ]]; then
+          echo "WARNING: No knownclusterblast*.txt/tsv found; creating placeholder." >> "{log}"
+          echo "No knownclusterblast text output produced." > "{output.antismash_results}"
+        else
+          cp -f "$KCB" "{output.antismash_results}"
+        fi
+
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+
+rule final_report:
+    input:
+        busco=busco_summary,
+        checkm=checkm_summary,
+        quast=quast_report,
+        prokka=prokka_gff,
+        interproscan=interpro_tsv,
+        kofamscan=kofamscan_out,
+        dbcan=dbcan_overview,
+        #crispr=crispr_summary,
+        antismash=antismash_txt,
+        repeatmasker=repeatmasker_gff
+    output:
+        report=final_report
+    params:
+        PY=PY, STATUS=STATUS, JOB_ID=JOB_ID,
+        step="final_report",
+        summary="Write final summary"
+    log:
+        f"{logdir}/final_report.log"
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.report})" "$(dirname {log})"
+        {params.PY} {params.STATUS} steps start {params.JOB_ID} {params.step} "{params.summary}" --msg "{params.summary}"
+        set +e
+        {
+          echo "Final Report for {sample}";
+          echo "";
+          echo "BUSCO Summary:";          [ -f {input.busco} ] && cat {input.busco} || echo "missing";
+          echo ""; echo "CheckM Summary:"; [ -f {input.checkm} ] && cat {input.checkm} || echo "missing";
+          echo ""; echo "QUAST Report (HTML path): {input.quast}";
+          echo ""; echo "Prokka (first 100 lines):";     head -n 100 {input.prokka} || true;
+          echo ""; echo "InterProScan (first 100):";     head -n 100 {input.interproscan} || true;
+          echo ""; echo "KofamScan (first 100):";        head -n 100 {input.kofamscan} || true;
+          echo ""; echo "dbCAN Overview:";               [ -f {input.dbcan} ] && cat {input.dbcan} || echo "missing";
+          echo ""; echo "AntiSMASH (first 100):";        head -n 100 {input.antismash} || true;
+          echo ""; echo "RepeatMasker (first 100):";     head -n 100 {input.repeatmasker} || true;
+        } > {output.report}
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then {params.PY} {params.STATUS} steps fail {params.JOB_ID} {params.step} "{params.summary}" --msg "Exit $rc"; exit $rc; fi
+        {params.PY} {params.STATUS} steps done {params.JOB_ID} {params.step} "{params.summary}"
+        """
+
+# ===========================
+# Manifest for UI
+# ===========================
+def guess_kind(path):
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".html": "html", ".htm": "html",
+        ".png": "image", ".jpg": "image", ".jpeg": "image", ".svg": "image",
+        ".pdf": "pdf",
+        ".fa": "fasta", ".fasta": "fasta", ".fq": "fastq", ".fastq": "fastq",
+        ".tsv": "table", ".csv": "table", ".txt": "text", ".json": "json",
+        ".gff": "gff"
+    }.get(ext, "file")
+
+
+rule manifest:
+    message:
+        "Writing manifest.json"
+    output:
+        manifest_path
+    run:
+        import os as _os, json as _json
+
+        workdir = _os.getcwd()
+        arts = []
+
+        for root, _, files in _os.walk(workdir):
+            # Skip Snakemake internals
+            if ".snakemake" in root:
+                continue
+            for f in files:
+                if f == "manifest.json":
+                    continue
+                full = _os.path.join(root, f)
+                rel = _os.path.relpath(full, workdir)
+                arts.append({
+                    "name": rel,
+                    "kind": guess_kind(rel),
+                })
+
+        with open(output[0], "w") as h:
+            _json.dump(
+                {
+                    "job_id": config.get("JOB_ID", ""),
+                    "artifacts": sorted(arts, key=lambda a: a["name"]),
+                },
+                h,
+                indent=2,
+            )

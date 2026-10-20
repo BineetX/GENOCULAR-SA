@@ -1,0 +1,7 @@
+name: kraken2_env
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - kraken2=2.1.6
+  - bracken=3.1

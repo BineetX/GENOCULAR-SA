@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "job_id": "demo-fixture",
+  "sample": "DEMO_COMMUNITY_HYBRID",
+  "analysis_type": "metagenomics",
+  "mode": "hybrid",
+  "generated_at": "2026-08-18T00:00:00Z",
+  "sections": [{"id": "meta_coverm_abundance", "title": "MAG relative abundance", "type": "plotly", "path": "analysis_plots/overview.json", "source": "demo", "order": 100, "renderer": "coverm_abundance"}],
+  "generator_runs": []
+}

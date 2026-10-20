@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "job_id": "demo-fixture",
+  "sample": "DEMO_ECOLI_LONG",
+  "analysis_type": "wgs",
+  "mode": "long",
+  "generated_at": "2026-08-18T00:00:00Z",
+  "sections": [{"id": "nanostat_qc", "title": "Long-read quality", "type": "plotly", "path": "analysis_plots/overview.json", "source": "demo", "order": 100, "renderer": "nanostat_qc"}],
+  "generator_runs": []
+}

@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "metagenomics:long",
+  "sample": "DEMO_COMMUNITY_LONG",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example long-read community workflow with filtering, host removal, assembly, polishing, binning, MAG quality, and annotation outputs."
+}

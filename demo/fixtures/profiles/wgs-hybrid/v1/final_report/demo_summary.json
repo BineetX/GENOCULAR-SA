@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "wgs:hybrid",
+  "sample": "DEMO_ECOLI_HYBRID",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example hybrid isolate workflow combining short- and long-read QC, hybrid assembly, genome QC, and annotation outputs."
+}

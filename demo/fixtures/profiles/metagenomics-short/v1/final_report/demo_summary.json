@@ -1,0 +1,7 @@
+{
+  "demo": true,
+  "profile": "metagenomics:short",
+  "sample": "DEMO_COMMUNITY_SHORT",
+  "notice": "Synthetic demonstration result; not for scientific use.",
+  "summary": "Example short-read community workflow with QC, taxonomy, assembly, binning, MAG quality, abundance, and annotation outputs."
+}
