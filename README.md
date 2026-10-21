@@ -318,14 +318,7 @@ Host with an existing database tree:
   --gpu
 ```
 
-The complete first run can take many hours. It downloads and validates hundreds
-of gigabytes of reference data, builds the application images, creates isolated
-Conda environments for the workflow profiles, starts the stack, pulls the
-configured Ollama models, and waits for health checks.
-
-Database transfers and environment setup are designed to be rerun. Existing
-downloaded files, generated secrets, named volumes, and valid environments are
-preserved.
+The complete first run can take hours. On the first run it downloads and validates all the required reference data, builds the application images, creates Conda environments for the all the 6 snakemake pipeline profiles, starts the stack, pulls the models, and waits for health checks. The database transfers and environment setup are designed to be rerun. Existing downloaded files, generated secrets, named volumes, and valid environments are preserved in your local machine.
 
 ### 7. Open and verify the deployment
 
@@ -454,8 +447,7 @@ Update Firebase Authorized domains and the host firewall at the same time.
 
 ### Demonstration mode
 
-The six demo choices play a one-minute, clock-driven example using small
-synthetic fixtures in `demo/fixtures/`. They do not execute Snakemake or the
+We have also kep six demo dummy runs which play a one-minute demostartion run, clock-driven example using small synthetic fixtures in `demo/fixtures/`. They do not execute Snakemake or the
 underlying scientific tools. Demo output is useful for checking navigation and
 presentation, but it must not be used for scientific interpretation.
 
